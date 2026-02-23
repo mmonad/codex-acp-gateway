@@ -82,8 +82,7 @@ impl Client for GatewayAcpClient {
                 response_tx,
             })
             .map_err(|_| {
-                agent_client_protocol::Error::internal_error()
-                    .data("gateway event loop shut down")
+                agent_client_protocol::Error::internal_error().data("gateway event loop shut down")
             })?;
         response_rx.await.map_err(|_| {
             agent_client_protocol::Error::internal_error()

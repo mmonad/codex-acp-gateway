@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use codex_app_server_protocol::{
     JSONRPCError, JSONRPCErrorError, JSONRPCMessage, JSONRPCNotification, JSONRPCRequest,
@@ -110,7 +110,10 @@ impl OutgoingMessageSender {
     /// Serialize a `JSONRPCMessage` and push it to the writer channel.
     async fn send_raw(&self, message: JSONRPCMessage) -> Result<(), SendError> {
         let json = serde_json::to_string(&message).map_err(SendError::Serialize)?;
-        self.tx.send(json).await.map_err(|_| SendError::ChannelClosed)
+        self.tx
+            .send(json)
+            .await
+            .map_err(|_| SendError::ChannelClosed)
     }
 }
 

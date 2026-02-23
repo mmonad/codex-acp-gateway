@@ -25,23 +25,21 @@ pub fn spawn_reader(
     tokio::spawn(async move {
         while let Some(frame) = ws_read.next().await {
             match frame {
-                Ok(Message::Text(text)) => {
-                    match serde_json::from_str::<JSONRPCMessage>(&text) {
-                        Ok(msg) => {
-                            if tx
-                                .send(TransportEvent::MessageReceived { message: msg })
-                                .await
-                                .is_err()
-                            {
-                                debug!("ws reader: receiver dropped, shutting down");
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "failed to parse WebSocket JSON-RPC message");
+                Ok(Message::Text(text)) => match serde_json::from_str::<JSONRPCMessage>(&text) {
+                    Ok(msg) => {
+                        if tx
+                            .send(TransportEvent::MessageReceived { message: msg })
+                            .await
+                            .is_err()
+                        {
+                            debug!("ws reader: receiver dropped, shutting down");
+                            return;
                         }
                     }
-                }
+                    Err(e) => {
+                        warn!(error = %e, "failed to parse WebSocket JSON-RPC message");
+                    }
+                },
                 Ok(Message::Ping(data)) => {
                     let _ = pong_tx.send(data.to_vec()).await;
                 }

@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use agent_client_protocol::{
-    ClientCapabilities, ContentBlock, FileSystemCapability, InitializeRequest,
-    LoadSessionRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, TextContent,
+    ClientCapabilities, ContentBlock, FileSystemCapability, InitializeRequest, LoadSessionRequest,
+    NewSessionRequest, PromptRequest, ProtocolVersion, SetSessionConfigOptionRequest,
+    SetSessionModeRequest, TextContent,
 };
 use serde_json::Value;
 
@@ -32,11 +32,9 @@ pub fn translate_initialize(params: &Value) -> InitializeRequest {
     // Advertise the callbacks the gateway handles locally.
     req = req.client_capabilities(
         ClientCapabilities::new()
-            .fs(
-                FileSystemCapability::new()
-                    .read_text_file(true)
-                    .write_text_file(true),
-            )
+            .fs(FileSystemCapability::new()
+                .read_text_file(true)
+                .write_text_file(true))
             .terminal(true),
     );
 
@@ -65,9 +63,7 @@ pub fn translate_turn_start(params: &Value, session_id: &str) -> PromptRequest {
         codex_input_to_acp(inputs)
     } else {
         // Fallback: if there's no structured input, check for a plain text field
-        vec![ContentBlock::Text(TextContent::new(
-            "[empty turn input]",
-        ))]
+        vec![ContentBlock::Text(TextContent::new("[empty turn input]"))]
     };
 
     PromptRequest::new(session_id.to_string(), prompt)
@@ -89,10 +85,7 @@ pub fn translate_thread_resume(
 }
 
 /// Translate into an ACP `SetSessionModeRequest`.
-pub fn translate_set_session_mode(
-    session_id: &str,
-    mode_id: &str,
-) -> SetSessionModeRequest {
+pub fn translate_set_session_mode(session_id: &str, mode_id: &str) -> SetSessionModeRequest {
     SetSessionModeRequest::new(session_id.to_string(), mode_id.to_string())
 }
 

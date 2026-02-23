@@ -150,6 +150,32 @@ The vendored `codex-app-server-protocol` crate has both v1 (legacy) and v2
 - Integration tests: spawn a mock ACP agent, send Codex messages, verify output
 - The vendored crates have their own test suites: `cargo test -p codex-app-server-protocol`
 
+## Reusing Codex app-server implementations
+
+When implementing gateway features that are **outside ACP translation** (i.e.,
+Codex-specific behavior with no ACP equivalent), reuse the official Codex
+app-server implementation from `../codex/` as much as possible. This includes:
+
+- Handlers for Codex-specific requests (e.g., `experimentalFeature/list`)
+- Local feature logic (e.g., turn diff tracking, token usage formatting)
+- Self-contained utility modules that can be adapted without pulling in the
+  full Codex agent (e.g., `turn_diff_tracker.rs`)
+
+Prefer adapting Codex's existing code over writing new implementations from
+scratch to stay consistent with Codex client expectations and reduce drift.
+
+## What NOT to implement
+
+Do not implement Codex app-server methods that are **agent-triggered** but have
+**no ACP equivalent**. If there is no ACP event that can trigger a Codex
+notification or server request, the gateway has no source event to translate —
+the implementation would be dead code. Examples: `item/tool/requestUserInput`,
+`item/commandExecution/terminalInteraction`.
+
+The exception is **client-initiated queries** that the gateway can answer
+locally without an ACP trigger (e.g., `experimentalFeature/list` returns a
+static empty list).
+
 ## Common pitfalls
 
 1. **!Send futures**: ACP SDK requires LocalSet. See note above.

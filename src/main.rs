@@ -9,8 +9,7 @@ async fn main() {
     // Initialize tracing with the configured log level
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level)),
         )
         .with_writer(std::io::stderr)
         .init();

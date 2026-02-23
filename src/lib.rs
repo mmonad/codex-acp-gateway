@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod config;
 pub mod error;
+pub mod rollout;
 pub mod translation;
 pub mod transport;
 
@@ -9,8 +10,14 @@ use std::rc::Rc;
 use agent_client_protocol::{Agent, ClientSideConnection};
 use anyhow::{Context, Result};
 use codex_app_server_protocol::{JSONRPCMessage, JSONRPCRequest, JSONRPCResponse};
+use codex_app_server_protocol::build_turns_from_rollout_items;
+use codex_protocol::protocol::{
+    EventMsg, RolloutItem, SessionMeta, SessionMetaLine, SessionSource, ThreadRolledBackEvent,
+};
 use futures::StreamExt;
 use serde_json::{Value, json};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -26,6 +33,17 @@ use crate::transport::TransportEvent;
 use crate::transport::outgoing::OutgoingMessageSender;
 use crate::transport::stdio;
 use crate::transport::websocket;
+
+/// Internal events produced by background tasks (e.g. `spawn_local` prompt)
+/// and processed by the main event loop to update gateway state.
+enum InternalEvent {
+    /// The ACP `agent.prompt()` call completed (success or failure).
+    TurnCompleted {
+        thread_id: String,
+        turn_id: String,
+        succeeded: bool,
+    },
+}
 
 /// Run the gateway. This is the main entry point called from `main()`.
 ///
@@ -69,14 +87,13 @@ pub async fn run(config: GatewayConfig) -> Result<()> {
                         let (tcp_stream, peer_addr) = listener.accept().await?;
                         debug!(%peer_addr, "TCP connection accepted");
 
-                        let ws_stream =
-                            match tokio_tungstenite::accept_async(tcp_stream).await {
-                                Ok(ws) => ws,
-                                Err(e) => {
-                                    warn!(%peer_addr, "WebSocket handshake failed: {e}");
-                                    continue;
-                                }
-                            };
+                        let ws_stream = match tokio_tungstenite::accept_async(tcp_stream).await {
+                            Ok(ws) => ws,
+                            Err(e) => {
+                                warn!(%peer_addr, "WebSocket handshake failed: {e}");
+                                continue;
+                            }
+                        };
 
                         info!(%peer_addr, "WebSocket client connected");
                         let (ws_write, ws_read) = ws_stream.split();
@@ -91,9 +108,7 @@ pub async fn run(config: GatewayConfig) -> Result<()> {
                         let cfg = config.clone();
                         let cwd = cwd.clone();
                         tokio::task::spawn_local(async move {
-                            if let Err(e) =
-                                run_session(&cfg, &cwd, inbound_rx, outbound_tx).await
-                            {
+                            if let Err(e) = run_session(&cfg, &cwd, inbound_rx, outbound_tx).await {
                                 warn!(%peer_addr, "session error: {e:#}");
                             }
                             info!(%peer_addr, "session ended");
@@ -120,14 +135,17 @@ async fn run_session(
 ) -> Result<()> {
     let outgoing = OutgoingMessageSender::new(codex_outbound_tx);
 
-    let (acp_conn, mut acp_events) =
-        acp::connect(&config.agent_cmd, &config.agent_args, cwd)
-            .await
-            .context("failed to connect to ACP agent")?;
+    let (acp_conn, mut acp_events) = acp::connect(&config.agent_cmd, &config.agent_args, cwd)
+        .await
+        .context("failed to connect to ACP agent")?;
 
     let mut state = GatewayState::new();
     let mut id_map = IdMap::new();
     let agent = Rc::new(acp_conn.agent);
+
+    // Channel for background tasks (e.g. spawn_local prompt) to notify the
+    // main loop about lifecycle transitions.
+    let (internal_tx, mut internal_rx) = mpsc::channel::<InternalEvent>(64);
 
     info!("gateway event loop started");
 
@@ -143,6 +161,7 @@ async fn run_session(
                             &mut state,
                             &mut id_map,
                             cwd,
+                            &internal_tx,
                         ).await;
                     }
                     Some(TransportEvent::Disconnected) | None => {
@@ -168,6 +187,12 @@ async fn run_session(
                     }
                 }
             }
+
+            event = internal_rx.recv() => {
+                if let Some(internal_event) = event {
+                    handle_internal_event(internal_event, &mut state, &outgoing).await;
+                }
+            }
         }
     }
 
@@ -182,10 +207,11 @@ async fn handle_codex_message(
     state: &mut GatewayState,
     id_map: &mut IdMap,
     cwd: &std::path::Path,
+    internal_tx: &mpsc::Sender<InternalEvent>,
 ) {
     match message {
         JSONRPCMessage::Request(req) => {
-            handle_codex_request(req, agent, outgoing, state, id_map, cwd).await;
+            handle_codex_request(req, agent, outgoing, state, id_map, cwd, internal_tx).await;
         }
         JSONRPCMessage::Response(resp) => {
             // This is a response to a server-initiated request (e.g., approval)
@@ -213,6 +239,7 @@ async fn handle_codex_request(
     state: &mut GatewayState,
     id_map: &mut IdMap,
     cwd: &std::path::Path,
+    internal_tx: &mpsc::Sender<InternalEvent>,
 ) {
     let id = req.id.clone();
     let params = req.params.clone().unwrap_or(json!({}));
@@ -224,22 +251,52 @@ async fn handle_codex_request(
             return;
         }
         "thread/start" => handle_thread_start(&params, agent.as_ref(), state, id_map, cwd).await,
-        "thread/resume" => {
-            handle_thread_resume(&params, agent.as_ref(), state, id_map, cwd).await
-        }
-        "turn/start" => {
-            handle_turn_start(&params, Rc::clone(agent), outgoing, state, id_map).await
-        }
-        "turn/interrupt" => {
-            handle_turn_interrupt(&params, agent.as_ref(), state, id_map).await
-        }
-        "session/setMode" => {
-            handle_set_session_mode(&params, agent.as_ref(), state, id_map).await
-        }
+        "thread/resume" => handle_thread_resume(&params, agent.as_ref(), state, id_map, cwd).await,
+        "turn/start" => handle_turn_start(&params, Rc::clone(agent), outgoing, state, id_map, internal_tx).await,
+        "turn/interrupt" => handle_turn_interrupt(&params, agent.as_ref(), state, id_map).await,
+        "session/setMode" => handle_set_session_mode(&params, agent.as_ref(), state, id_map).await,
         "session/setConfigOption" => {
             handle_set_session_config_option(&params, agent.as_ref(), state, id_map).await
         }
         "command/exec" => handle_command_exec(&params, cwd).await,
+        "fuzzyFileSearch" => handle_fuzzy_file_search(&params, cwd).await,
+        "experimentalFeature/list" => Ok(json!({ "data": [], "nextCursor": null })),
+        "thread/loaded/list" => {
+            let loaded: Vec<Value> = state
+                .threads
+                .iter()
+                .filter(|(_, lifecycle)| {
+                    matches!(
+                        lifecycle,
+                        SessionLifecycle::Idle { .. } | SessionLifecycle::InTurn { .. }
+                    )
+                })
+                .map(|(thread_id, _)| json!({ "threadId": thread_id }))
+                .collect();
+            Ok(json!({ "data": loaded, "nextCursor": null }))
+        }
+        "thread/list" => handle_thread_list(&params, state).await,
+        "thread/read" => handle_thread_read(&params, state).await,
+        "thread/fork" => handle_thread_fork(&params, agent.as_ref(), state, id_map, cwd).await,
+        "thread/rollback" => handle_thread_rollback(&params, agent.as_ref(), state, id_map, cwd).await,
+        "model/list" => {
+            Ok(json!({ "data": [{ "id": "acp-agent", "name": "ACP Agent" }], "nextCursor": null }))
+        }
+
+        // Stub handlers — return empty/default responses
+        "config/read" => Ok(json!({ "config": {}, "layers": [] })),
+        "config/value/write" => Ok(json!({ "success": true })),
+        "config/batchWrite" => Ok(json!({ "success": true })),
+        "configRequirements/read" => Ok(json!({ "requirements": {} })),
+        "mcpServerStatus/list" => Ok(json!({ "data": [], "nextCursor": null })),
+        "config/mcpServer/reload" => Ok(json!({})),
+        "skills/list" => Ok(json!({ "data": [], "nextCursor": null })),
+        "thread/name/set" => handle_thread_name_set(&params, state, outgoing).await,
+        "thread/archive" => handle_thread_archive(&params, state, outgoing).await,
+        "thread/unarchive" => handle_thread_unarchive(&params, state, outgoing).await,
+        "thread/compact/start" => Ok(json!({})),
+        "thread/backgroundTerminals/clean" => Ok(json!({})),
+
         method => {
             debug!(method, "unhandled codex request method");
             Err(GatewayError::Translation(format!(
@@ -249,22 +306,25 @@ async fn handle_codex_request(
     };
 
     // After successful thread/start or thread/resume, emit a thread/started notification.
-    let emit_thread_started = matches!(req.method.as_str(), "thread/start" | "thread/resume")
-        && result.is_ok();
+    // Extract the thread from the response value (works for both start and resume).
+    let emit_thread_started =
+        matches!(req.method.as_str(), "thread/start" | "thread/resume" | "thread/fork") && result.is_ok();
 
     match result {
         Ok(value) => {
+            // Clone thread info before sending response (which consumes it).
+            let thread_obj = if emit_thread_started {
+                value.get("thread").cloned()
+            } else {
+                None
+            };
+
             if let Err(e) = outgoing.send_response(id, value).await {
                 error!("failed to send response: {e}");
             }
-            if emit_thread_started
-                && let Some(thread_id) = params.get("threadId").and_then(|v| v.as_str())
-            {
+            if let Some(thread) = thread_obj {
                 let _ = outgoing
-                    .send_notification(
-                        "thread/started",
-                        Some(json!({ "threadId": thread_id })),
-                    )
+                    .send_notification("thread/started", Some(json!({ "thread": thread })))
                     .await;
             }
         }
@@ -298,8 +358,7 @@ async fn handle_initialize(
     // Auto-authenticate if the agent advertises auth methods.
     if let Some(first_method) = acp_resp.auth_methods.first() {
         info!(method_id = %first_method.id.0, "auto-authenticating with agent");
-        let auth_req =
-            agent_client_protocol::AuthenticateRequest::new(first_method.id.clone());
+        let auth_req = agent_client_protocol::AuthenticateRequest::new(first_method.id.clone());
         agent
             .authenticate(auth_req)
             .await
@@ -365,13 +424,39 @@ async fn handle_thread_start(
 
     info!(%thread_id, %session_id, "thread/session created");
 
+    // Build SessionMetaLine for the rollout recorder.
+    let now_str = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let session_meta = SessionMetaLine {
+        meta: SessionMeta {
+            id: codex_protocol::ThreadId::from_string(&thread_id)
+                .unwrap_or_default(),
+            forked_from_id: None,
+            timestamp: now_str.clone(),
+            cwd: cwd.to_path_buf(),
+            originator: "codex-acp-gateway".to_string(),
+            cli_version: "0.1.0".to_string(),
+            source: SessionSource::VSCode,
+            agent_nickname: None,
+            agent_role: None,
+            model_provider: Some("acp".to_string()),
+            base_instructions: None,
+            dynamic_tools: None,
+        },
+        git: None,
+    };
+
+    // Start recording this thread to a rollout file.
+    state.rollout.start_thread(&session_meta);
+
     Ok(json!({
         "thread": {
             "id": thread_id,
             "cwd": cwd.to_string_lossy(),
             "cliVersion": "0.1.0",
-            "createdAt": chrono_now_secs(),
-            "updatedAt": chrono_now_secs(),
+            "createdAt": now_str,
+            "updatedAt": now_str,
             "modelProvider": "acp",
             "preview": "",
             "source": "appServer",
@@ -396,6 +481,7 @@ async fn handle_turn_start(
     outgoing: &OutgoingMessageSender,
     state: &mut GatewayState,
     id_map: &mut IdMap,
+    internal_tx: &mpsc::Sender<InternalEvent>,
 ) -> Result<Value, GatewayError> {
     let thread_id = params
         .get("threadId")
@@ -410,6 +496,16 @@ async fn handle_turn_start(
         .clone();
 
     let turn_id = id_map::new_turn_id();
+
+    // Clean up any previous turn diffs for this thread
+    if let SessionLifecycle::InTurn {
+        turn_id: prev_turn_id,
+        ..
+    } = state.lifecycle(thread_id)
+    {
+        let prev = prev_turn_id.clone();
+        state.turn_diffs.remove(&prev);
+    }
 
     state.set_lifecycle(
         thread_id.to_string(),
@@ -431,6 +527,17 @@ async fn handle_turn_start(
                     "status": "inProgress",
                     "error": null,
                 },
+            })),
+        )
+        .await;
+
+    // Notify the Codex client that this thread is now active.
+    let _ = outgoing
+        .send_notification(
+            "thread/status/changed",
+            Some(json!({
+                "threadId": thread_id,
+                "status": { "type": "active", "activeFlags": [] },
             })),
         )
         .await;
@@ -459,9 +566,10 @@ async fn handle_turn_start(
     let outgoing_clone = outgoing.clone();
     let thread_id_owned = thread_id.to_string();
     let turn_id_clone = turn_id.clone();
+    let internal_tx = internal_tx.clone();
 
     tokio::task::spawn_local(async move {
-        match agent.prompt(acp_req).await {
+        let succeeded = match agent.prompt(acp_req).await {
             Ok(resp) => {
                 let stop_reason = format!("{:?}", resp.stop_reason);
                 let (method, params) = acp_to_codex::translate_prompt_response(
@@ -487,9 +595,8 @@ async fn handle_turn_start(
                     .await;
 
                 // Send turn/completed
-                let _ = outgoing_clone
-                    .send_notification(method, Some(params))
-                    .await;
+                let _ = outgoing_clone.send_notification(method, Some(params)).await;
+                true
             }
             Err(e) => {
                 error!("ACP prompt failed: {e:?}");
@@ -509,8 +616,18 @@ async fn handle_turn_start(
                         })),
                     )
                     .await;
+                false
             }
-        }
+        };
+
+        // Notify the main event loop to transition lifecycle InTurn → Idle.
+        let _ = internal_tx
+            .send(InternalEvent::TurnCompleted {
+                thread_id: thread_id_owned,
+                turn_id: turn_id_clone,
+                succeeded,
+            })
+            .await;
     });
 
     // Return the turn/start response immediately (streaming happens via notifications)
@@ -550,10 +667,7 @@ async fn handle_turn_interrupt(
         .await
         .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
 
-    state.set_lifecycle(
-        thread_id.to_string(),
-        SessionLifecycle::Idle { session_id },
-    );
+    state.set_lifecycle(thread_id.to_string(), SessionLifecycle::Idle { session_id });
 
     Ok(json!({}))
 }
@@ -613,21 +727,37 @@ async fn handle_thread_resume(
 
     info!(%thread_id, %session_id, "thread/session resumed");
 
+    let now_secs = unix_now_secs();
+
+    // Try to read session meta from the rollout file for richer response.
+    let (meta_provider, meta_created, meta_source) =
+        if let Some(path) = state.rollout.find_thread_file(thread_id) {
+            if let Ok(meta) = crate::rollout::list::read_session_meta_line(&path).await {
+                let created = parse_rfc3339_to_unix(&meta.meta.timestamp).unwrap_or(now_secs);
+                let provider = meta.meta.model_provider.unwrap_or_else(|| "acp".into());
+                (provider, created, meta.meta.source)
+            } else {
+                ("acp".into(), now_secs, SessionSource::VSCode)
+            }
+        } else {
+            ("acp".into(), now_secs, SessionSource::VSCode)
+        };
+
     Ok(json!({
         "thread": {
             "id": thread_id,
             "cwd": cwd.to_string_lossy(),
             "cliVersion": "0.1.0",
-            "createdAt": chrono_now_secs(),
-            "updatedAt": chrono_now_secs(),
-            "modelProvider": "acp",
+            "createdAt": meta_created,
+            "updatedAt": now_secs,
+            "modelProvider": meta_provider,
             "preview": "",
-            "source": "appServer",
+            "source": meta_source,
             "status": { "type": "idle" },
             "turns": [],
         },
         "model": "acp-agent",
-        "modelProvider": "acp",
+        "modelProvider": meta_provider,
         "cwd": cwd.to_string_lossy(),
         "approvalPolicy": "on-request",
         "sandbox": { "type": "dangerFullAccess" },
@@ -696,8 +826,7 @@ async fn handle_set_session_config_option(
         })?
         .clone();
 
-    let acp_req =
-        codex_to_acp::translate_set_session_config_option(&session_id, config_id, value);
+    let acp_req = codex_to_acp::translate_set_session_config_option(&session_id, config_id, value);
     let acp_resp = agent
         .set_session_config_option(acp_req)
         .await
@@ -725,15 +854,399 @@ async fn handle_set_session_config_option(
     Ok(json!({ "configOptions": options }))
 }
 
+/// Handle `thread/list` — return persisted threads from rollout files.
+///
+/// Uses the vendored `rollout::list::get_threads()` for paginated listing
+/// with proper Codex-compatible Thread JSON.
+async fn handle_thread_list(
+    params: &Value,
+    state: &GatewayState,
+) -> Result<Value, GatewayError> {
+    use crate::rollout::list::{self, ThreadSortKey, parse_cursor};
+    use crate::rollout::INTERACTIVE_SESSION_SOURCES;
+
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50) as usize;
+
+    let cursor = params
+        .get("cursor")
+        .and_then(|v| v.as_str())
+        .and_then(parse_cursor);
+
+    let sort_key = match params.get("sortKey").and_then(|v| v.as_str()) {
+        Some("updatedAt") => ThreadSortKey::UpdatedAt,
+        _ => ThreadSortKey::CreatedAt,
+    };
+
+    let gateway_home = state.rollout.gateway_home();
+    let page = list::get_threads(
+        gateway_home,
+        limit,
+        cursor.as_ref(),
+        sort_key,
+        INTERACTIVE_SESSION_SOURCES,
+        None,
+        "acp",
+    )
+    .await
+    .map_err(|e| GatewayError::Translation(format!("thread/list failed: {e}")))?;
+
+    // Load thread names for all items.
+    let thread_ids: std::collections::HashSet<codex_protocol::ThreadId> = page
+        .items
+        .iter()
+        .filter_map(|item| item.thread_id)
+        .collect();
+    let names = crate::rollout::session_index::find_thread_names_by_ids(gateway_home, &thread_ids)
+        .await
+        .unwrap_or_default();
+
+    let data: Vec<Value> = page
+        .items
+        .iter()
+        .map(|item| {
+            let name = item
+                .thread_id
+                .and_then(|id| names.get(&id))
+                .cloned();
+            build_thread_json_from_list_item(item, name, &state.threads)
+        })
+        .collect();
+
+    let next_cursor = page.next_cursor.and_then(|c| serde_json::to_value(c).ok());
+
+    Ok(json!({ "data": data, "nextCursor": next_cursor }))
+}
+
+/// Handle `thread/read` — return a thread with its turns from rollout file.
+///
+/// Uses `load_rollout_items()` + `build_turns_from_rollout_items()` for
+/// Codex-compatible Thread JSON with turn reconstruction.
+async fn handle_thread_read(
+    params: &Value,
+    state: &GatewayState,
+) -> Result<Value, GatewayError> {
+    use crate::rollout::list;
+    use crate::rollout::recorder::RolloutRecorder;
+
+    let thread_id = params
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("missing threadId".into()))?;
+
+    let include_turns = params
+        .get("includeTurns")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let gateway_home = state.rollout.gateway_home();
+
+    // Find the rollout file (in-memory map first, then filesystem scan).
+    let file_path = state
+        .rollout
+        .find_thread_file(thread_id)
+        .ok_or_else(|| GatewayError::Translation(format!("thread not found: {thread_id}")))?;
+
+    // Read the session meta from the first line.
+    let meta = list::read_session_meta_line(&file_path)
+        .await
+        .map_err(|e| GatewayError::Translation(format!("failed to read session meta: {e}")))?;
+
+    // Load rollout items for turn reconstruction.
+    let items = RolloutRecorder::load_rollout_items(&file_path);
+
+    let turns = if include_turns {
+        let turns = build_turns_from_rollout_items(&items);
+        serde_json::to_value(turns).unwrap_or(json!([]))
+    } else {
+        json!([])
+    };
+
+    // Get thread name from session index.
+    let name = if let Ok(tid) = codex_protocol::ThreadId::from_string(thread_id) {
+        crate::rollout::session_index::find_thread_name_by_id(gateway_home, &tid)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    let now_secs = unix_now_secs();
+    let created_secs = parse_rfc3339_to_unix(&meta.meta.timestamp).unwrap_or(now_secs);
+    let status = lifecycle_to_thread_status(state.lifecycle(thread_id));
+
+    Ok(json!({
+        "thread": {
+            "id": thread_id,
+            "preview": "",
+            "modelProvider": meta.meta.model_provider.as_deref().unwrap_or("acp"),
+            "createdAt": created_secs,
+            "updatedAt": now_secs,
+            "status": status,
+            "path": file_path.to_string_lossy(),
+            "cwd": meta.meta.cwd.to_string_lossy(),
+            "cliVersion": meta.meta.cli_version,
+            "source": meta.meta.source,
+            "gitInfo": meta.git,
+            "name": name,
+            "turns": turns,
+        },
+    }))
+}
+
+/// Handle `thread/fork` — fork an existing thread into a new one.
+///
+/// Loads all rollout items from the source thread, creates a new thread with a
+/// new ID, copies the items into the new rollout file, and creates a fresh ACP
+/// session for the forked thread.
+async fn handle_thread_fork(
+    params: &Value,
+    agent: &(impl Agent + ?Sized),
+    state: &mut GatewayState,
+    id_map: &mut IdMap,
+    _cwd: &std::path::Path,
+) -> Result<Value, GatewayError> {
+    use crate::rollout::list;
+    use crate::rollout::recorder::RolloutRecorder;
+
+    if !state.initialized {
+        return Err(GatewayError::NotInitialized);
+    }
+
+    let source_thread_id = params
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("missing threadId".into()))?;
+
+    let gateway_home = state.rollout.gateway_home().to_path_buf();
+
+    // Find and load the source rollout file.
+    let source_path = list::find_thread_path_by_id_str(&gateway_home, source_thread_id)
+        .await
+        .map_err(|e| GatewayError::Translation(format!("fork: scan failed: {e}")))?
+        .ok_or_else(|| {
+            GatewayError::Translation(format!("fork: thread not found: {source_thread_id}"))
+        })?;
+
+    let items = RolloutRecorder::load_rollout_items(&source_path);
+
+    // Read source session meta for inheriting properties.
+    let source_meta = list::read_session_meta_line(&source_path)
+        .await
+        .map_err(|e| GatewayError::Translation(format!("fork: failed to read meta: {e}")))?;
+
+    // Generate a new thread ID for the fork.
+    let new_thread_id = id_map::new_thread_id();
+    state.set_lifecycle(new_thread_id.clone(), SessionLifecycle::Creating);
+
+    let now_str = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    // Use fork params to override cwd if provided, otherwise inherit from source.
+    let fork_cwd = params
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| source_meta.meta.cwd.clone());
+
+    let source_tid = codex_protocol::ThreadId::from_string(source_thread_id).ok();
+
+    let model_provider = params
+        .get("modelProvider")
+        .and_then(|v| v.as_str())
+        .unwrap_or(source_meta.meta.model_provider.as_deref().unwrap_or("acp"))
+        .to_string();
+
+    let new_meta = SessionMetaLine {
+        meta: SessionMeta {
+            id: codex_protocol::ThreadId::from_string(&new_thread_id).unwrap_or_default(),
+            forked_from_id: source_tid,
+            timestamp: now_str.clone(),
+            cwd: fork_cwd.clone(),
+            originator: "codex-acp-gateway".to_string(),
+            cli_version: "0.1.0".to_string(),
+            source: SessionSource::VSCode,
+            agent_nickname: None,
+            agent_role: None,
+            model_provider: Some(model_provider.clone()),
+            base_instructions: params
+                .get("baseInstructions")
+                .and_then(|v| v.as_str())
+                .map(|text| codex_protocol::models::BaseInstructions {
+                    text: text.to_string(),
+                }),
+            dynamic_tools: None,
+        },
+        git: source_meta.git,
+    };
+
+    // Start recording the new thread.
+    state.rollout.start_thread(&new_meta);
+
+    // Copy all non-SessionMeta items from the source rollout into the new file.
+    for item in &items {
+        if matches!(item, RolloutItem::SessionMeta(_)) {
+            continue;
+        }
+        state.rollout.record_item(&new_thread_id, item.clone());
+    }
+
+    // Build fork params for ACP session creation, using the fork's cwd.
+    let acp_params = json!({ "cwd": fork_cwd.to_string_lossy() });
+    let acp_req = codex_to_acp::translate_thread_start(&acp_params, &fork_cwd);
+    let acp_resp = agent
+        .new_session(acp_req)
+        .await
+        .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
+
+    let session_id = acp_resp.session_id.to_string();
+    id_map.create_thread_session_mapping(new_thread_id.clone(), session_id.clone());
+    state.set_lifecycle(
+        new_thread_id.clone(),
+        SessionLifecycle::Idle {
+            session_id: session_id.clone(),
+        },
+    );
+
+    info!(%new_thread_id, %session_id, source = %source_thread_id, "thread forked");
+
+    // Build turns from all items (including copied ones) for the response.
+    let turns = build_turns_from_rollout_items(&items);
+    let turns_json = serde_json::to_value(&turns).unwrap_or(json!([]));
+
+    let created_secs = parse_rfc3339_to_unix(&now_str).unwrap_or_else(unix_now_secs);
+
+    Ok(json!({
+        "thread": {
+            "id": new_thread_id,
+            "cwd": fork_cwd.to_string_lossy(),
+            "cliVersion": "0.1.0",
+            "createdAt": created_secs,
+            "updatedAt": created_secs,
+            "modelProvider": model_provider,
+            "preview": "",
+            "source": "appServer",
+            "status": { "type": "idle" },
+            "turns": turns_json,
+        },
+        "model": "acp-agent",
+        "modelProvider": model_provider,
+        "cwd": fork_cwd.to_string_lossy(),
+        "approvalPolicy": "on-request",
+        "sandbox": { "type": "dangerFullAccess" },
+    }))
+}
+
+/// Handle `thread/rollback` — roll back the last N turns from a thread.
+///
+/// Records a `ThreadRolledBack` event to the rollout file, rebuilds turns
+/// from the updated rollout items, and creates a fresh ACP session since the
+/// old session context is stale after rollback.
+async fn handle_thread_rollback(
+    params: &Value,
+    agent: &(impl Agent + ?Sized),
+    state: &mut GatewayState,
+    id_map: &mut IdMap,
+    _cwd: &std::path::Path,
+) -> Result<Value, GatewayError> {
+    use crate::rollout::list;
+    use crate::rollout::recorder::RolloutRecorder;
+
+    if !state.initialized {
+        return Err(GatewayError::NotInitialized);
+    }
+
+    let thread_id = params
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("missing threadId".into()))?;
+
+    let num_turns = params
+        .get("numTurns")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .ok_or_else(|| GatewayError::Translation("missing numTurns".into()))?;
+
+    if num_turns < 1 {
+        return Err(GatewayError::Translation("numTurns must be >= 1".into()));
+    }
+
+    // Find the rollout file.
+    let file_path = state
+        .rollout
+        .find_thread_file(thread_id)
+        .ok_or_else(|| GatewayError::Translation(format!("thread not found: {thread_id}")))?;
+
+    // Record the ThreadRolledBack event to the rollout file.
+    state.rollout.record_item(
+        thread_id,
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns,
+        })),
+    );
+
+    // Reload all items (now including the rollback marker) and rebuild turns.
+    let items = RolloutRecorder::load_rollout_items(&file_path);
+    let turns = build_turns_from_rollout_items(&items);
+    let turns_json = serde_json::to_value(&turns).unwrap_or(json!([]));
+
+    // Read session meta for response fields.
+    let meta = list::read_session_meta_line(&file_path)
+        .await
+        .map_err(|e| GatewayError::Translation(format!("rollback: failed to read meta: {e}")))?;
+
+    let rollback_cwd = meta.meta.cwd.clone();
+
+    // Create a new ACP session (old session context is stale after rollback).
+    let acp_req = codex_to_acp::translate_thread_start(
+        &json!({ "cwd": rollback_cwd.to_string_lossy() }),
+        &rollback_cwd,
+    );
+    let acp_resp = agent
+        .new_session(acp_req)
+        .await
+        .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
+
+    let new_session_id = acp_resp.session_id.to_string();
+    id_map.create_thread_session_mapping(thread_id.to_string(), new_session_id.clone());
+    state.set_lifecycle(
+        thread_id.to_string(),
+        SessionLifecycle::Idle {
+            session_id: new_session_id.clone(),
+        },
+    );
+
+    info!(%thread_id, %new_session_id, %num_turns, "thread rolled back");
+
+    let now_secs = unix_now_secs();
+    let created_secs = parse_rfc3339_to_unix(&meta.meta.timestamp).unwrap_or(now_secs);
+
+    Ok(json!({
+        "thread": {
+            "id": thread_id,
+            "preview": "",
+            "modelProvider": meta.meta.model_provider.as_deref().unwrap_or("acp"),
+            "createdAt": created_secs,
+            "updatedAt": now_secs,
+            "status": { "type": "idle" },
+            "cwd": rollback_cwd.to_string_lossy(),
+            "cliVersion": meta.meta.cli_version,
+            "source": meta.meta.source,
+            "turns": turns_json,
+        },
+    }))
+}
+
 /// Handle `command/exec` — execute a command locally and return its output.
 ///
 /// This is a Codex client request for one-off command execution (e.g. running
 /// a build tool). The gateway handles it directly without involving the ACP
 /// agent.
-async fn handle_command_exec(
-    params: &Value,
-    cwd: &std::path::Path,
-) -> Result<Value, GatewayError> {
+async fn handle_command_exec(params: &Value, cwd: &std::path::Path) -> Result<Value, GatewayError> {
     let command: Vec<String> = params
         .get("command")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -772,9 +1285,7 @@ async fn handle_command_exec(
         child.wait_with_output(),
     )
     .await
-    .map_err(|_| {
-        GatewayError::Translation(format!("command/exec timed out after {timeout_ms}ms"))
-    })?
+    .map_err(|_| GatewayError::Translation(format!("command/exec timed out after {timeout_ms}ms")))?
     .map_err(|e| GatewayError::Translation(format!("command/exec failed: {e}")))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -785,6 +1296,105 @@ async fn handle_command_exec(
         "stdout": stdout,
         "stderr": stderr,
     }))
+}
+
+/// Handle `fuzzyFileSearch` — perform a one-shot fuzzy file search.
+///
+/// Uses `codex_file_search::run` inside `spawn_blocking` since the search is
+/// CPU-bound. Returns results matching the `FuzzyFileSearchResponse` schema.
+async fn handle_fuzzy_file_search(
+    params: &Value,
+    cwd: &std::path::Path,
+) -> Result<Value, GatewayError> {
+    let query = params
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("fuzzyFileSearch: missing 'query'".into()))?
+        .to_string();
+
+    let roots: Vec<std::path::PathBuf> = params
+        .get("roots")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![cwd.to_path_buf()]);
+
+    if roots.is_empty() {
+        return Ok(json!({ "files": [] }));
+    }
+
+    const MATCH_LIMIT: usize = 50;
+    const MAX_THREADS: usize = 12;
+
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let threads = cores.clamp(1, MAX_THREADS);
+    #[allow(clippy::expect_used)]
+    let limit = std::num::NonZero::new(MATCH_LIMIT).expect("MATCH_LIMIT is non-zero");
+    #[allow(clippy::expect_used)]
+    let threads = std::num::NonZero::new(threads).expect("threads is non-zero");
+
+    let files = match tokio::task::spawn_blocking(move || {
+        codex_file_search::run(
+            &query,
+            roots,
+            codex_file_search::FileSearchOptions {
+                limit,
+                threads,
+                compute_indices: true,
+                ..Default::default()
+            },
+            None,
+        )
+    })
+    .await
+    {
+        Ok(Ok(res)) => {
+            let mut files: Vec<Value> = res
+                .matches
+                .into_iter()
+                .map(|m| {
+                    let file_name = m
+                        .path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    json!({
+                        "root": m.root.to_string_lossy(),
+                        "path": m.path.to_string_lossy(),
+                        "file_name": file_name,
+                        "score": m.score,
+                        "indices": m.indices,
+                    })
+                })
+                .collect();
+            files.sort_by(|a, b| {
+                let sa = a["score"].as_u64().unwrap_or(0);
+                let sb = b["score"].as_u64().unwrap_or(0);
+                sb.cmp(&sa).then_with(|| {
+                    let pa = a["path"].as_str().unwrap_or("");
+                    let pb = b["path"].as_str().unwrap_or("");
+                    pa.cmp(pb)
+                })
+            });
+            files
+        }
+        Ok(Err(e)) => {
+            warn!("fuzzyFileSearch failed: {e}");
+            Vec::new()
+        }
+        Err(e) => {
+            warn!("fuzzyFileSearch join failed: {e}");
+            Vec::new()
+        }
+    };
+
+    Ok(json!({ "files": files }))
 }
 
 /// Handle an ACP event (notification or permission request from the agent).
@@ -808,12 +1418,41 @@ async fn handle_acp_event(
                 _ => "unknown-turn".to_string(),
             };
 
-            let notifications =
+            let result =
                 acp_to_codex::translate_session_update(&notif.update, &thread_id, &turn_id, id_map);
 
-            for (method, params) in notifications {
+            for (method, params) in result.notifications {
+                // TODO(task3): map each notification to the proper EventMsg/RolloutItem
+                // and call state.rollout.record_item(&thread_id, item).
                 if let Err(e) = outgoing.send_notification(&method, Some(params)).await {
                     warn!(method, "failed to send notification: {e}");
+                }
+            }
+
+            // TODO: emit thread/tokenUsage/updated notification once ACP reports
+            // token usage data in session updates (not currently available).
+
+            // Accumulate diffs and emit turn/diff/updated aggregate notification
+            if !result.diffs.is_empty() {
+                let accumulated = state.turn_diffs.entry(turn_id.clone()).or_default();
+                accumulated.extend(result.diffs);
+
+                // Build aggregated diff: for each unique path, use FIRST old_text
+                // and LAST new_text across all accumulated diffs.
+                let aggregated = build_aggregated_diff(accumulated);
+
+                if let Err(e) = outgoing
+                    .send_notification(
+                        "turn/diff/updated",
+                        Some(json!({
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                            "diff": aggregated,
+                        })),
+                    )
+                    .await
+                {
+                    warn!("failed to send turn/diff/updated: {e}");
                 }
             }
         }
@@ -849,37 +1488,352 @@ async fn handle_acp_event(
                     tokio::task::spawn_local(async move {
                         match rx.await {
                             Ok(resp) => {
-                                let acp_resp =
-                                    approval::translate_codex_approval_to_acp(&resp.result, &options);
+                                let acp_resp = approval::translate_codex_approval_to_acp(
+                                    &resp.result,
+                                    &options,
+                                );
                                 let _ = response_tx.send(acp_resp);
                             }
                             Err(_) => {
-                                let _ = response_tx.send(
-                                    agent_client_protocol::RequestPermissionResponse::new(
+                                let _ =
+                                    response_tx
+                                        .send(agent_client_protocol::RequestPermissionResponse::new(
                                         agent_client_protocol::RequestPermissionOutcome::Cancelled,
-                                    ),
-                                );
+                                    ));
                             }
                         }
                     });
                 }
                 Err(e) => {
                     error!("failed to send approval request to codex client: {e}");
-                    let _ = response_tx.send(
-                        agent_client_protocol::RequestPermissionResponse::new(
+                    let _ =
+                        response_tx.send(agent_client_protocol::RequestPermissionResponse::new(
                             agent_client_protocol::RequestPermissionOutcome::Cancelled,
-                        ),
-                    );
+                        ));
                 }
             }
         }
     }
 }
 
+/// Process an internal event from a background task (e.g. turn completion).
+///
+/// Resets lifecycle from `InTurn` → `Idle` so the gateway knows the turn is
+/// done and the session is ready for the next prompt.
+async fn handle_internal_event(
+    event: InternalEvent,
+    state: &mut GatewayState,
+    outgoing: &OutgoingMessageSender,
+) {
+    match event {
+        InternalEvent::TurnCompleted {
+            thread_id,
+            turn_id,
+            succeeded,
+        } => {
+            debug!(
+                %thread_id,
+                %turn_id,
+                %succeeded,
+                "turn completed, resetting lifecycle to Idle"
+            );
+
+            // Extract the session_id from the current InTurn state.
+            let session_id = match state.lifecycle(&thread_id) {
+                SessionLifecycle::InTurn { session_id, .. } => session_id.clone(),
+                other => {
+                    warn!(
+                        %thread_id,
+                        lifecycle = ?other,
+                        "TurnCompleted received but lifecycle is not InTurn"
+                    );
+                    return;
+                }
+            };
+
+            // Clean up turn diffs for the completed turn.
+            state.turn_diffs.remove(&turn_id);
+
+            // Transition lifecycle: InTurn → Idle.
+            state.set_lifecycle(
+                thread_id.clone(),
+                SessionLifecycle::Idle { session_id },
+            );
+
+            // Notify the Codex client that this thread is now idle.
+            let _ = outgoing
+                .send_notification(
+                    "thread/status/changed",
+                    Some(json!({
+                        "threadId": thread_id,
+                        "status": { "type": "idle" },
+                    })),
+                )
+                .await;
+        }
+    }
+}
+
+/// Build an aggregated unified diff string from accumulated per-turn diffs.
+///
+/// For each unique file path, uses the FIRST `old_text` and the LAST `new_text`
+/// across all diffs for that path, then generates a unified diff.
+fn build_aggregated_diff(diffs: &[(std::path::PathBuf, Option<String>, String)]) -> String {
+    use std::collections::BTreeMap;
+
+    // Collect first old_text and last new_text per path (BTreeMap for stable ordering).
+    let mut per_file: BTreeMap<&std::path::Path, (Option<&str>, &str)> = BTreeMap::new();
+    for (path, old_text, new_text) in diffs {
+        per_file
+            .entry(path.as_path())
+            .and_modify(|entry| {
+                // Keep first old_text, update to latest new_text
+                entry.1 = new_text.as_str();
+            })
+            .or_insert((old_text.as_deref(), new_text.as_str()));
+    }
+
+    let mut output = String::new();
+    for (path, (old, new_text)) in &per_file {
+        let path_display = path.display();
+        let old = old.unwrap_or("");
+
+        let diff = similar::TextDiff::from_lines(old, *new_text);
+        let unified = diff
+            .unified_diff()
+            .context_radius(3)
+            .header(&format!("a/{path_display}"), &format!("b/{path_display}"))
+            .to_string();
+
+        output.push_str(&format!("diff --git a/{path_display} b/{path_display}\n"));
+        output.push_str(&unified);
+    }
+
+    output
+}
+
+/// Handle `thread/name/set` — set a user-facing name for a thread.
+async fn handle_thread_name_set(
+    params: &Value,
+    state: &GatewayState,
+    outgoing: &OutgoingMessageSender,
+) -> Result<Value, GatewayError> {
+    let thread_id = params
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("missing threadId".into()))?;
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("missing name".into()))?;
+
+    let tid = codex_protocol::ThreadId::from_string(thread_id)
+        .map_err(|_| GatewayError::Translation(format!("invalid threadId: {thread_id}")))?;
+
+    crate::rollout::session_index::append_thread_name(
+        state.rollout.gateway_home(),
+        tid,
+        name,
+    )
+    .await
+    .map_err(|e| GatewayError::Translation(format!("failed to set thread name: {e}")))?;
+
+    let _ = outgoing
+        .send_notification(
+            "thread/name/updated",
+            Some(json!({ "threadId": thread_id, "threadName": name })),
+        )
+        .await;
+
+    Ok(json!({}))
+}
+
+/// Handle `thread/archive` — move a rollout file to the archived sessions dir.
+async fn handle_thread_archive(
+    params: &Value,
+    state: &mut GatewayState,
+    outgoing: &OutgoingMessageSender,
+) -> Result<Value, GatewayError> {
+    use crate::rollout::{ARCHIVED_SESSIONS_SUBDIR, list};
+
+    let thread_id = params
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("missing threadId".into()))?;
+
+    let gateway_home = state.rollout.gateway_home().to_path_buf();
+
+    let source_path = list::find_thread_path_by_id_str(&gateway_home, thread_id)
+        .await
+        .map_err(|e| GatewayError::Translation(format!("archive scan failed: {e}")))?
+        .ok_or_else(|| GatewayError::Translation(format!("thread not found: {thread_id}")))?;
+
+    let archive_dir = gateway_home.join(ARCHIVED_SESSIONS_SUBDIR);
+    tokio::fs::create_dir_all(&archive_dir)
+        .await
+        .map_err(|e| GatewayError::Translation(format!("failed to create archive dir: {e}")))?;
+
+    let file_name = source_path
+        .file_name()
+        .ok_or_else(|| GatewayError::Translation("invalid rollout path".into()))?;
+    let dest_path = archive_dir.join(file_name);
+
+    tokio::fs::rename(&source_path, &dest_path)
+        .await
+        .map_err(|e| GatewayError::Translation(format!("failed to archive thread: {e}")))?;
+
+    // Close any open writer and update lifecycle.
+    state.rollout.close_file(thread_id);
+    state.set_lifecycle(thread_id.to_string(), SessionLifecycle::Closed);
+
+    let _ = outgoing
+        .send_notification(
+            "thread/archived",
+            Some(json!({ "threadId": thread_id })),
+        )
+        .await;
+
+    Ok(json!({}))
+}
+
+/// Handle `thread/unarchive` — move a rollout file back from archived to sessions.
+async fn handle_thread_unarchive(
+    params: &Value,
+    state: &mut GatewayState,
+    outgoing: &OutgoingMessageSender,
+) -> Result<Value, GatewayError> {
+    use crate::rollout::{SESSIONS_SUBDIR, list};
+
+    let thread_id = params
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("missing threadId".into()))?;
+
+    let gateway_home = state.rollout.gateway_home().to_path_buf();
+
+    let source_path = list::find_archived_thread_path_by_id_str(&gateway_home, thread_id)
+        .await
+        .map_err(|e| GatewayError::Translation(format!("unarchive scan failed: {e}")))?
+        .ok_or_else(|| {
+            GatewayError::Translation(format!("archived thread not found: {thread_id}"))
+        })?;
+
+    // Parse YYYY/MM/DD from the filename to reconstruct the directory path.
+    let file_name = source_path
+        .file_name()
+        .ok_or_else(|| GatewayError::Translation("invalid rollout path".into()))?;
+    let (year, month, day) = list::rollout_date_parts(file_name)
+        .ok_or_else(|| GatewayError::Translation("cannot parse date from rollout filename".into()))?;
+
+    let dest_dir = gateway_home
+        .join(SESSIONS_SUBDIR)
+        .join(&year)
+        .join(&month)
+        .join(&day);
+    tokio::fs::create_dir_all(&dest_dir)
+        .await
+        .map_err(|e| GatewayError::Translation(format!("failed to create sessions dir: {e}")))?;
+
+    let dest_path = dest_dir.join(file_name);
+    tokio::fs::rename(&source_path, &dest_path)
+        .await
+        .map_err(|e| GatewayError::Translation(format!("failed to unarchive thread: {e}")))?;
+
+    // Read meta from the restored file for the response.
+    let meta = list::read_session_meta_line(&dest_path)
+        .await
+        .map_err(|e| GatewayError::Translation(format!("failed to read session meta: {e}")))?;
+
+    let now_secs = unix_now_secs();
+    let created_secs = parse_rfc3339_to_unix(&meta.meta.timestamp).unwrap_or(now_secs);
+
+    let _ = outgoing
+        .send_notification(
+            "thread/unarchived",
+            Some(json!({ "threadId": thread_id })),
+        )
+        .await;
+
+    Ok(json!({
+        "thread": {
+            "id": thread_id,
+            "preview": "",
+            "modelProvider": meta.meta.model_provider.as_deref().unwrap_or("acp"),
+            "createdAt": created_secs,
+            "updatedAt": now_secs,
+            "status": { "type": "notLoaded" },
+            "cwd": meta.meta.cwd.to_string_lossy(),
+            "cliVersion": meta.meta.cli_version,
+            "source": meta.meta.source,
+            "turns": [],
+        },
+    }))
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────
+
+/// Build a Thread JSON object from a `list::ThreadItem` for `thread/list`.
+fn build_thread_json_from_list_item(
+    item: &crate::rollout::list::ThreadItem,
+    name: Option<String>,
+    threads: &std::collections::HashMap<String, SessionLifecycle>,
+) -> Value {
+    let thread_id_str = item
+        .thread_id
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    let status = lifecycle_to_thread_status(
+        threads
+            .get(&thread_id_str)
+            .unwrap_or(&SessionLifecycle::Uninitialized),
+    );
+    let created_secs = item
+        .created_at
+        .as_deref()
+        .and_then(parse_rfc3339_to_unix)
+        .unwrap_or(0);
+    let updated_secs = item
+        .updated_at
+        .as_deref()
+        .and_then(parse_rfc3339_to_unix)
+        .unwrap_or(created_secs);
+
+    json!({
+        "id": thread_id_str,
+        "preview": item.first_user_message.as_deref().unwrap_or(""),
+        "modelProvider": item.model_provider.as_deref().unwrap_or("acp"),
+        "createdAt": created_secs,
+        "updatedAt": updated_secs,
+        "status": status,
+        "cwd": item.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+        "cliVersion": item.cli_version.as_deref().unwrap_or(""),
+        "source": item.source.as_ref().unwrap_or(&SessionSource::VSCode),
+        "name": name,
+        "turns": [],
+    })
+}
+
+/// Map `SessionLifecycle` to a Codex `ThreadStatus` JSON value.
+fn lifecycle_to_thread_status(lifecycle: &SessionLifecycle) -> Value {
+    match lifecycle {
+        SessionLifecycle::Idle { .. } => json!({ "type": "idle" }),
+        SessionLifecycle::InTurn { .. } => json!({ "type": "active", "activeFlags": ["agentTurn"] }),
+        SessionLifecycle::Closed => json!({ "type": "notLoaded" }),
+        _ => json!({ "type": "notLoaded" }),
+    }
+}
+
 /// Return current unix timestamp in seconds.
-fn chrono_now_secs() -> i64 {
+fn unix_now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Parse an RFC 3339 timestamp string to unix seconds.
+fn parse_rfc3339_to_unix(s: &str) -> Option<i64> {
+    OffsetDateTime::parse(s, &Rfc3339)
+        .ok()
+        .map(|dt| dt.unix_timestamp())
 }

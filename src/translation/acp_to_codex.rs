@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use agent_client_protocol::{
     ContentBlock, EmbeddedResourceResource, SessionUpdate, ToolCallStatus, ToolKind,
 };
@@ -5,42 +7,58 @@ use serde_json::{Value, json};
 
 use super::id_map::IdMap;
 
+/// Result of translating a session update.
+pub struct TranslationResult {
+    /// Codex notifications to emit: (method, params).
+    pub notifications: Vec<(String, Value)>,
+    /// File diffs collected for turn-level aggregation (path, old_text, new_text).
+    pub diffs: Vec<(PathBuf, Option<String>, String)>,
+}
+
 /// Translate an ACP `SessionUpdate` into one or more Codex notification JSON values.
 ///
-/// Each returned tuple is `(method, params)` for a Codex `ServerNotification`.
+/// Each returned notification tuple is `(method, params)` for a Codex `ServerNotification`.
 /// A single ACP update may produce multiple Codex notifications (e.g., a ToolCall
 /// produces both an `item/started` and potentially content notifications).
+///
+/// The returned `diffs` field collects file diffs for turn-level aggregation.
 pub fn translate_session_update(
     update: &SessionUpdate,
     thread_id: &str,
     turn_id: &str,
     id_map: &mut IdMap,
-) -> Vec<(String, Value)> {
+) -> TranslationResult {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             let delta = extract_text_from_content(&chunk.content);
-            vec![(
-                "item/agentMessage/delta".to_string(),
-                json!({
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                    "itemId": format!("{turn_id}-msg"),
-                    "delta": delta,
-                }),
-            )]
+            TranslationResult {
+                notifications: vec![(
+                    "item/agentMessage/delta".to_string(),
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "itemId": format!("{turn_id}-msg"),
+                        "delta": delta,
+                    }),
+                )],
+                diffs: vec![],
+            }
         }
         SessionUpdate::AgentThoughtChunk(chunk) => {
             let delta = extract_text_from_content(&chunk.content);
-            vec![(
-                "item/reasoning/summaryTextDelta".to_string(),
-                json!({
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                    "itemId": format!("{turn_id}-reasoning"),
-                    "delta": delta,
-                    "summaryIndex": 0,
-                }),
-            )]
+            TranslationResult {
+                notifications: vec![(
+                    "item/reasoning/summaryTextDelta".to_string(),
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "itemId": format!("{turn_id}-reasoning"),
+                        "delta": delta,
+                        "summaryIndex": 0,
+                    }),
+                )],
+                diffs: vec![],
+            }
         }
         SessionUpdate::ToolCall(tool_call) => {
             let tool_call_id = tool_call.tool_call_id.0.as_ref();
@@ -87,14 +105,17 @@ pub fn translate_session_update(
                 }
             };
 
-            vec![(
-                "item/started".to_string(),
-                json!({
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                    "item": item,
-                }),
-            )]
+            TranslationResult {
+                notifications: vec![(
+                    "item/started".to_string(),
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "item": item,
+                    }),
+                )],
+                diffs: vec![],
+            }
         }
         SessionUpdate::ToolCallUpdate(update) => {
             let tool_call_id = update.tool_call_id.0.as_ref();
@@ -104,23 +125,62 @@ pub fn translate_session_update(
                 .unwrap_or_else(|| format!("unknown-{tool_call_id}"));
 
             let mut notifications = Vec::new();
+            let mut diffs = Vec::new();
 
             // Emit output delta if there's content
             if let Some(content) = &update.fields.content {
                 for tc_content in content {
-                    if let agent_client_protocol::ToolCallContent::Content(c) = tc_content {
-                        let text = extract_text_from_content(&c.content);
-                        if !text.is_empty() {
+                    match tc_content {
+                        agent_client_protocol::ToolCallContent::Content(c) => {
+                            let text = extract_text_from_content(&c.content);
+                            if !text.is_empty() {
+                                // Route to correct notification based on tool kind
+                                let method = match id_map.lookup_tool_kind(tool_call_id) {
+                                    Some(ToolKind::Edit | ToolKind::Delete | ToolKind::Move) => {
+                                        "item/fileChange/outputDelta"
+                                    }
+                                    _ => "item/commandExecution/outputDelta",
+                                };
+                                notifications.push((
+                                    method.to_string(),
+                                    json!({
+                                        "threadId": thread_id,
+                                        "turnId": turn_id,
+                                        "itemId": item_id,
+                                        "delta": text,
+                                    }),
+                                ));
+                            }
+                        }
+                        agent_client_protocol::ToolCallContent::Diff(d) => {
+                            // Compute unified diff
+                            let old = d.old_text.as_deref().unwrap_or("");
+                            let new_text = &d.new_text;
+                            let path = d.path.display();
+
+                            let diff = similar::TextDiff::from_lines(old, new_text);
+                            let unified = diff
+                                .unified_diff()
+                                .context_radius(3)
+                                .header(&format!("a/{path}"), &format!("b/{path}"))
+                                .to_string();
+
+                            let delta = format!("diff --git a/{path} b/{path}\n{unified}");
+
                             notifications.push((
-                                "item/commandExecution/outputDelta".to_string(),
+                                "item/fileChange/outputDelta".to_string(),
                                 json!({
                                     "threadId": thread_id,
                                     "turnId": turn_id,
                                     "itemId": item_id,
-                                    "delta": text,
+                                    "delta": delta,
                                 }),
                             ));
+
+                            // Collect for turn-level aggregation
+                            diffs.push((d.path.clone(), d.old_text.clone(), d.new_text.clone()));
                         }
+                        _ => {} // Terminal -- handled via ACP Client trait locally
                     }
                 }
             }
@@ -129,55 +189,58 @@ pub fn translate_session_update(
             if let Some(status) = &update.fields.status
                 && matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed)
             {
-                    let codex_status = match status {
-                        ToolCallStatus::Completed => "completed",
-                        ToolCallStatus::Failed => "failed",
-                        _ => "inProgress",
-                    };
+                let codex_status = match status {
+                    ToolCallStatus::Completed => "completed",
+                    ToolCallStatus::Failed => "failed",
+                    _ => "inProgress",
+                };
 
-                    let title = update.fields.title.as_deref().unwrap_or("unknown");
-                    let kind = id_map.lookup_tool_kind(tool_call_id);
+                let title = update.fields.title.as_deref().unwrap_or("unknown");
+                let kind = id_map.lookup_tool_kind(tool_call_id);
 
-                    let item = match kind {
-                        Some(ToolKind::Execute) => json!({
-                            "type": "commandExecution",
-                            "id": item_id,
-                            "command": title,
-                            "cwd": ".",
-                            "status": codex_status,
-                            "exitCode": null,
-                            "durationMs": null,
-                        }),
-                        Some(ToolKind::Edit | ToolKind::Delete | ToolKind::Move) => json!({
-                            "type": "fileChange",
-                            "id": item_id,
-                            "changes": [],
-                            "status": codex_status,
-                        }),
-                        _ => json!({
-                            "type": "mcpToolCall",
-                            "id": item_id,
-                            "server": "acp",
-                            "tool": title,
-                            "status": codex_status,
-                            "arguments": {},
-                            "result": null,
-                            "error": null,
-                            "durationMs": null,
-                        }),
-                    };
+                let item = match kind {
+                    Some(ToolKind::Execute) => json!({
+                        "type": "commandExecution",
+                        "id": item_id,
+                        "command": title,
+                        "cwd": ".",
+                        "status": codex_status,
+                        "exitCode": null,
+                        "durationMs": null,
+                    }),
+                    Some(ToolKind::Edit | ToolKind::Delete | ToolKind::Move) => json!({
+                        "type": "fileChange",
+                        "id": item_id,
+                        "changes": [],
+                        "status": codex_status,
+                    }),
+                    _ => json!({
+                        "type": "mcpToolCall",
+                        "id": item_id,
+                        "server": "acp",
+                        "tool": title,
+                        "status": codex_status,
+                        "arguments": {},
+                        "result": null,
+                        "error": null,
+                        "durationMs": null,
+                    }),
+                };
 
-                    notifications.push((
-                        "item/completed".to_string(),
-                        json!({
-                            "threadId": thread_id,
-                            "turnId": turn_id,
-                            "item": item,
-                        }),
-                    ));
+                notifications.push((
+                    "item/completed".to_string(),
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "item": item,
+                    }),
+                ));
             }
 
-            notifications
+            TranslationResult {
+                notifications,
+                diffs,
+            }
         }
         SessionUpdate::Plan(plan) => {
             let steps: Vec<Value> = plan
@@ -196,19 +259,25 @@ pub fn translate_session_update(
                 })
                 .collect();
 
-            vec![(
-                "turn/plan/updated".to_string(),
-                json!({
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                    "explanation": null,
-                    "plan": steps,
-                }),
-            )]
+            TranslationResult {
+                notifications: vec![(
+                    "turn/plan/updated".to_string(),
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "explanation": null,
+                        "plan": steps,
+                    }),
+                )],
+                diffs: vec![],
+            }
         }
         SessionUpdate::UserMessageChunk(_) => {
-            // Echo of user input — the Codex client already has it, so ignore.
-            vec![]
+            // Echo of user input -- the Codex client already has it, so ignore.
+            TranslationResult {
+                notifications: vec![],
+                diffs: vec![],
+            }
         }
         SessionUpdate::AvailableCommandsUpdate(update) => {
             let commands: Vec<Value> = update
@@ -221,23 +290,27 @@ pub fn translate_session_update(
                     })
                 })
                 .collect();
-            vec![(
-                "gateway/availableCommands/updated".to_string(),
-                json!({
-                    "threadId": thread_id,
-                    "commands": commands,
-                }),
-            )]
+            TranslationResult {
+                notifications: vec![(
+                    "gateway/availableCommands/updated".to_string(),
+                    json!({
+                        "threadId": thread_id,
+                        "commands": commands,
+                    }),
+                )],
+                diffs: vec![],
+            }
         }
-        SessionUpdate::CurrentModeUpdate(update) => {
-            vec![(
+        SessionUpdate::CurrentModeUpdate(update) => TranslationResult {
+            notifications: vec![(
                 "thread/status/changed".to_string(),
                 json!({
                     "threadId": thread_id,
                     "mode": update.current_mode_id.0.as_ref(),
                 }),
-            )]
-        }
+            )],
+            diffs: vec![],
+        },
         SessionUpdate::ConfigOptionUpdate(update) => {
             let options: Vec<Value> = update
                 .config_options
@@ -249,16 +322,22 @@ pub fn translate_session_update(
                     })
                 })
                 .collect();
-            vec![(
-                "gateway/configOptions/updated".to_string(),
-                json!({
-                    "threadId": thread_id,
-                    "configOptions": options,
-                }),
-            )]
+            TranslationResult {
+                notifications: vec![(
+                    "gateway/configOptions/updated".to_string(),
+                    json!({
+                        "threadId": thread_id,
+                        "configOptions": options,
+                    }),
+                )],
+                diffs: vec![],
+            }
         }
         // Future-proof: any new variants added upstream are silently ignored.
-        _ => vec![],
+        _ => TranslationResult {
+            notifications: vec![],
+            diffs: vec![],
+        },
     }
 }
 

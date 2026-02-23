@@ -7,9 +7,9 @@
 
 | Area | Implemented | Gap | Notes |
 |------|-------------|-----|-------|
-| Codex client requests (v2) | 8 of 36 | 28 | Management APIs, thread lifecycle, skills, config |
+| Codex client requests (v2) | 28 of 36 | 8 | Account, remote skills, steer/review |
 | Codex server requests | 2 of 5 | 3 | Tool input, dynamic tool call, token refresh |
-| Codex server notifications | 13 of ~35 | ~22 | Account, config, diff, usage notifications |
+| Codex server notifications | 19 of ~35 | ~16 | Account, config, usage, terminal notifications |
 | ACP Agent trait (stable) | 8 of 8 | 0 | Full coverage |
 | ACP Agent trait (unstable) | 0 of 4 | 4 | Feature-gated session methods |
 | ACP Client trait | 11 of 11 | 0 | Full coverage |
@@ -20,31 +20,14 @@
 
 ## 1. Codex Client Requests — Not Implemented
 
-### v2 (current API)
-
 | Wire method | Priority | Notes |
 |---|---|---|
-| `thread/fork` | Medium | Maps to ACP `session/fork` (unstable) |
-| `thread/archive` | Low | No ACP equivalent |
-| `thread/unarchive` | Low | No ACP equivalent |
-| `thread/list` | Low | Needs gateway-side persistent storage |
-| `thread/loaded/list` | Low | In-memory state query |
-| `thread/read` | Low | Needs gateway-side storage |
-| `thread/compact/start` | Low | No direct ACP equivalent |
-| `thread/rollback` | Low | No direct ACP equivalent |
-| `thread/name/set` | Low | Cosmetic, no ACP equivalent |
 | `turn/steer` | Medium | No ACP equivalent currently |
 | `review/start` | Low | Codex-specific feature |
-| `model/list` | Medium | Could query ACP agent info |
-| `skills/list` | Low | No ACP equivalent |
 | `skills/remote/list` | Low | No ACP equivalent |
 | `skills/remote/export` | Low | No ACP equivalent |
 | `skills/config/write` | Low | No ACP equivalent |
 | `app/list` | Low | No ACP equivalent |
-| `config/read` | Low | Gateway/agent config |
-| `config/value/write` | Low | Config write |
-| `config/batchWrite` | Low | Batch config write |
-| `configRequirements/read` | Low | Codex-specific |
 | `account/read` | Low | Codex auth, not applicable |
 | `account/login/start` | Low | Codex-specific |
 | `account/login/cancel` | Low | Codex-specific |
@@ -52,17 +35,12 @@
 | `account/rateLimits/read` | Low | Codex-specific |
 | `feedback/upload` | Low | Codex-specific |
 | `mcpServer/oauth/login` | Low | Codex-specific |
-| `config/mcpServer/reload` | Low | Codex-specific |
-| `mcpServerStatus/list` | Low | Codex-specific |
-| `experimentalFeature/list` | Low | Could return empty list |
 | `windowsSandbox/setupStart` | Low | Windows-only |
-| `fuzzyFileSearch` | Low | Could implement locally |
 
 ### Experimental
 
 | Wire method | Notes |
 |---|---|
-| `thread/backgroundTerminals/clean` | Experimental terminal cleanup |
 | `collaborationMode/list` | Experimental collaboration modes |
 | `fuzzyFileSearch/session*` | Experimental incremental file search |
 
@@ -82,14 +60,9 @@
 
 | Wire method | Priority | Notes |
 |---|---|---|
-| `thread/archived` | Low | Archive confirmation |
-| `thread/unarchived` | Low | Unarchive confirmation |
-| `thread/name/updated` | Low | Name change confirmation |
-| `thread/tokenUsage/updated` | Medium | Token usage tracking — useful for UIs |
+| `thread/tokenUsage/updated` | Medium | Blocked on ACP `UsageUpdate` (RFD in Draft as of Jan 2026) |
 | `thread/compacted` | Low | Context compaction notification |
-| `turn/diff/updated` | Medium | Diff of file changes during a turn |
 | `item/plan/delta` | Low | Incremental plan text delta (we use `turn/plan/updated` instead) |
-| `item/fileChange/outputDelta` | Medium | File change content streaming |
 | `item/commandExecution/terminalInteraction` | Low | Terminal interaction events |
 | `item/mcpToolCall/progress` | Low | MCP tool call progress |
 | `item/reasoning/summaryPartAdded` | Low | Reasoning summary part boundaries |
@@ -125,7 +98,7 @@
 | SessionUpdate variant | Feature flag | Notes |
 |---|---|---|
 | `SessionInfoUpdate` | `unstable_session_info_update` | Session title/timestamp updates |
-| `UsageUpdate` | `unstable_session_usage` | Token usage / cost updates |
+| `UsageUpdate` | `unstable_session_usage` | Token usage / cost updates (RFD in Draft) |
 
 ---
 
@@ -149,9 +122,7 @@ actual capabilities or be configurable.
 
 ## 7. Recommended Next Steps
 
-1. **`model/list`** — Enables model selection; needs ACP unstable `session/set_model`
-2. **`thread/list` / `thread/read`** — Thread management; needs gateway-side storage
-3. **`turn/diff/updated`** — File diff notification; important for IDE integrations
-4. **`thread/tokenUsage/updated`** — Token tracking; could map to ACP unstable `UsageUpdate`
-5. **`experimentalFeature/list`** — Return empty list to avoid client errors
-6. **`turn/steer`** — Mid-turn steering; no ACP equivalent yet
+1. **`thread/tokenUsage/updated`** — Blocked on ACP `UsageUpdate` RFD (Draft)
+2. **`turn/steer`** — Mid-turn steering; no ACP equivalent yet
+3. **`item/tool/requestUserInput`** — Agent requests free-form user input
+4. **`item/tool/call`** — Dynamic client-side tool calls

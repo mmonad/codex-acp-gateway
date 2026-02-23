@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
-use agent_client_protocol::{
-    AgentCapabilities, AuthMethod, SessionConfigOption, SessionModeState,
-};
+use agent_client_protocol::{AgentCapabilities, AuthMethod, SessionConfigOption, SessionModeState};
+
+use crate::rollout::recorder::RolloutRecorder;
 
 /// Tracks the lifecycle state of a single Codex thread / ACP session pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,10 +17,7 @@ pub enum SessionLifecycle {
     /// The ACP session exists but no turn is active.
     Idle { session_id: String },
     /// A prompt turn is in progress.
-    InTurn {
-        session_id: String,
-        turn_id: String,
-    },
+    InTurn { session_id: String, turn_id: String },
     /// The session has been closed or the thread archived.
     Closed,
 }
@@ -42,6 +40,12 @@ pub struct GatewayState {
     pub session_modes: HashMap<String, SessionModeState>,
     /// Per-session config options (keyed by ACP session ID).
     pub session_config: HashMap<String, Vec<SessionConfigOption>>,
+    /// Accumulated file diffs per turn (keyed by turn ID).
+    /// Each entry is `(path, old_text, new_text)`.
+    pub turn_diffs: HashMap<String, Vec<(PathBuf, Option<String>, String)>>,
+    /// Rollout recorder for persisting thread history to disk.
+    /// Uses Codex-compatible `RolloutLine`/`RolloutItem` NDJSON format.
+    pub rollout: RolloutRecorder,
 }
 
 impl GatewayState {
@@ -55,6 +59,8 @@ impl GatewayState {
             auth_methods: Vec::new(),
             session_modes: HashMap::new(),
             session_config: HashMap::new(),
+            turn_diffs: HashMap::new(),
+            rollout: RolloutRecorder::default(),
         }
     }
 

@@ -34,7 +34,10 @@ pub async fn connect(
     cmd: &str,
     args: &[String],
     cwd: &Path,
-) -> Result<(AcpConnection, tokio::sync::mpsc::UnboundedReceiver<AcpEvent>)> {
+) -> Result<(
+    AcpConnection,
+    tokio::sync::mpsc::UnboundedReceiver<AcpEvent>,
+)> {
     let mut child = spawn::spawn_subprocess(cmd, args, cwd)?;
 
     let child_stdout = child
@@ -54,14 +57,9 @@ pub async fn connect(
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let client = GatewayAcpClient::new(event_tx);
 
-    let (connection, io_future) = ClientSideConnection::new(
-        client,
-        outgoing,
-        incoming,
-        |fut| {
-            tokio::task::spawn_local(fut);
-        },
-    );
+    let (connection, io_future) = ClientSideConnection::new(client, outgoing, incoming, |fut| {
+        tokio::task::spawn_local(fut);
+    });
 
     // Spawn the I/O loop on the local task set.
     tokio::task::spawn_local(async move {

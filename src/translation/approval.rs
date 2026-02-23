@@ -17,11 +17,7 @@ pub fn translate_permission_to_codex(
     turn_id: &str,
     item_id: &str,
 ) -> (String, Value) {
-    let kind = request
-        .tool_call
-        .fields
-        .kind
-        .unwrap_or(ToolKind::Other);
+    let kind = request.tool_call.fields.kind.unwrap_or(ToolKind::Other);
 
     let title = request
         .tool_call
@@ -73,7 +69,10 @@ pub fn translate_codex_approval_to_acp(
         .and_then(|v| v.as_str())
         .unwrap_or("decline");
 
-    let is_approve = matches!(decision, "accept" | "acceptForSession" | "acceptWithExecpolicyAmendment");
+    let is_approve = matches!(
+        decision,
+        "accept" | "acceptForSession" | "acceptWithExecpolicyAmendment"
+    );
 
     let outcome = find_matching_option(options, is_approve)
         .map(|opt| {
