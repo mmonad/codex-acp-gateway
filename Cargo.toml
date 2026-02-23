@@ -68,6 +68,7 @@ uuid = "1"
 walkdir = "2.5.0"
 async-trait = "0.1"
 futures = "0.3"
+tokio-tungstenite = "0.26"
 tokio-util = "0.7"
 
 [workspace.lints]
@@ -110,4 +111,5 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }

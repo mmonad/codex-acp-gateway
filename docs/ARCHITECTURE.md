@@ -11,7 +11,7 @@ backend.
 
 | Aspect                | Codex app-server protocol                    | ACP (Agent Client Protocol)               |
 |-----------------------|----------------------------------------------|--------------------------------------------|
-| **Transport**         | stdio NDJSON                                 | stdio NDJSON                               |
+| **Transport**         | stdio NDJSON or WebSocket                    | stdio NDJSON                               |
 | **Wire format**       | JSON-RPC (no `"jsonrpc"` field)              | JSON-RPC 2.0 (`"jsonrpc": "2.0"`)         |
 | **Session concept**   | Thread (thread/start, thread/resume)         | Session (session/new, session/load)        |
 | **Prompt concept**    | Turn (turn/start)                            | Prompt (session/prompt)                    |
@@ -29,7 +29,7 @@ backend.
                     +--------------------------+
                     |                          |
   Codex Client      |   +------------------+   |      ACP Agent
-  (stdin/stdout)    |   |                  |   |   (stdin/stdout)
+  (stdio or WS)     |   |                  |   |   (stdin/stdout)
        |            |   |   Translation    |   |        |
        |   Codex    |   |     Engine       |   |  ACP   |
        |  NDJSON    |   |                  |   | NDJSON  |
@@ -48,7 +48,7 @@ backend.
        |            |                          |        |
        |            +--------------------------+        |
        |                                                |
-       +--- stdin/stdout (Codex client) ----------------+
+       +--- stdio or WebSocket (Codex) ------------------+
                                          stdin/stdout (ACP agent subprocess)
 ```
 
@@ -142,6 +142,7 @@ the gateway lifecycle.
 
 ### `src/config.rs`
 Defines the CLI interface using clap. Key options:
+- `--listen`: transport URL — `stdio://` (default) or `ws://IP:PORT`
 - `--agent-cmd`: path/name of the ACP agent binary
 - Remaining args after `--`: forwarded to the agent process
 
@@ -150,10 +151,11 @@ Gateway-specific error types using thiserror. Covers transport errors, protocol
 translation errors, and subprocess management failures.
 
 ### `src/transport/`
-Codex-side NDJSON transport layer:
-- **Reader**: Reads NDJSON lines from stdin, deserializes into Codex `JSONRPCMessage` variants
-- **Writer**: Serializes Codex messages and writes them as NDJSON to stdout
-- Handles the Codex-specific framing (no `"jsonrpc"` field)
+Codex-side transport layer (pluggable: stdio or WebSocket):
+- **stdio**: Reads NDJSON lines from stdin, writes NDJSON to stdout
+- **websocket**: Reads/writes individual WebSocket Text frames (one JSON per frame)
+- **outgoing**: Transport-agnostic `OutgoingMessageSender` wrapping `mpsc::Sender<String>`
+- Both transports produce `TransportEvent` and consume `String` via the same channel interface
 
 ### `src/acp/`
 ACP subprocess management and Client trait implementation:
@@ -251,31 +253,41 @@ SessionUpdate (notification variants)
 
 ## Task/channel topology
 
+### Stdio mode
+
 ```
-tokio::task::LocalSet
+tokio::task::LocalSet (run_until)
   |
-  |-- Codex Reader Task
-  |     Reads stdin line-by-line, parses NDJSON
-  |     Sends parsed messages to translation engine via mpsc channel
+  |-- [tokio::spawn] Codex Stdio Reader
+  |     Reads stdin line-by-line, parses NDJSON -> mpsc -> event loop
   |
-  |-- Codex Writer Task
-  |     Receives translated messages from mpsc channel
-  |     Serializes and writes to stdout
+  |-- [tokio::spawn] Codex Stdio Writer
+  |     mpsc -> serialize + write to stdout
   |
-  |-- ACP Connection Task
-  |     Manages the RpcConnection to the ACP subprocess
-  |     Routes incoming ACP messages to the Client trait handler
-  |     Sends outgoing ACP requests via the connection
+  |-- run_session (directly awaited)
+        |-- ACP Connection (spawn_local tasks)
+        |-- Translation Event Loop (select! on both channels)
+        |-- Local Handler Tasks (fs, terminal)
+```
+
+### WebSocket mode
+
+```
+tokio::task::LocalSet (run_until)
   |
-  |-- Translation Engine
-  |     Receives Codex requests, translates, sends to ACP connection
-  |     Receives ACP events (via Client trait), translates, sends to Codex writer
-  |     Manages request ID correlation map
-  |     Manages session/thread state
-  |
-  |-- Local Handler Tasks (as needed)
-        fs read/write operations
-        terminal subprocess management
+  |-- TCP Accept Loop (directly awaited)
+        |
+        per connection:
+          |-- [tokio::spawn] WS Reader Task
+          |     WebSocket Text frames -> parse JSON -> mpsc -> session
+          |
+          |-- [tokio::spawn] WS Writer Task
+          |     mpsc -> WebSocket Text frames (+ Pong replies)
+          |
+          |-- [spawn_local] run_session
+                |-- ACP Connection (spawn_local tasks, own subprocess)
+                |-- Translation Event Loop (select! on both channels)
+                |-- Local Handler Tasks (fs, terminal)
 ```
 
 ## Translation state machine

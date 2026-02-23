@@ -24,7 +24,7 @@ cargo clippy --workspace
 This is a Rust protocol translation gateway between Codex app-server clients and
 ACP (Agent Client Protocol) agents. The gateway:
 
-1. Listens on stdio for Codex NDJSON messages (JSON-RPC without `"jsonrpc"` field)
+1. Listens on stdio or WebSocket for Codex NDJSON messages (JSON-RPC without `"jsonrpc"` field)
 2. Spawns an ACP agent subprocess, connects via stdio NDJSON (JSON-RPC 2.0 with `"jsonrpc": "2.0"`)
 3. Translates messages bidirectionally between the two protocols
 4. Handles ACP filesystem/terminal callbacks locally
@@ -35,9 +35,9 @@ ACP (Agent Client Protocol) agents. The gateway:
 Cargo.toml                    Workspace root, defines path deps + external deps
 src/                          Gateway binary source
   main.rs                     Entry point: CLI parsing, tokio runtime, orchestration
-  config.rs                   CLI argument definitions (clap)
+  config.rs                   CLI argument definitions (clap), --listen transport modes
   error.rs                    Gateway-specific error types (thiserror)
-  transport/                  Codex-side: stdio reader/writer, NDJSON framing
+  transport/                  Codex-side transport (stdio NDJSON + WebSocket)
   acp/                        ACP-side: subprocess lifecycle, Client trait impl
   translation/                Core translation engine between protocols
 crates/
@@ -101,12 +101,27 @@ These never reach the Codex client.
 
 ## Important implementation notes
 
+### Transport modes
+
+The gateway supports two transport modes for the Codex client side:
+- **Stdio** (`--listen stdio://`, default): one client via stdin/stdout, exit on EOF
+- **WebSocket** (`--listen ws://IP:PORT`): each WS client gets its own ACP subprocess
+
+Both modes use the same `mpsc` channel interface internally. The event loop
+(`run_session()`) is completely transport-agnostic.
+
+In WebSocket mode, each connection is handled via `spawn_local` inside the
+top-level `LocalSet`. The WS reader/writer tasks use `tokio::spawn` (they are
+`Send`), but session logic runs on the `LocalSet` because of ACP's `!Send`
+futures.
+
 ### ACP uses !Send futures
 
 The ACP SDK uses `async_trait(?Send)` -- all futures are `!Send`. This means:
-- You must use `tokio::task::LocalSet` for ACP-related async work
+- The top-level `run()` wraps everything in a `tokio::task::LocalSet`
 - The ACP subprocess connection must live on a single-threaded runtime or LocalSet
 - Do NOT spawn ACP futures with `tokio::spawn` (requires Send); use `tokio::task::spawn_local`
+- In WebSocket mode, per-connection sessions use `spawn_local` (not `tokio::spawn`)
 
 ### JSON-RPC framing differences
 

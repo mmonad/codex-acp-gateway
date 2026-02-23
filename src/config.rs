@@ -1,11 +1,18 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::Parser;
 
 /// Protocol translation gateway between Codex app-server clients and ACP agents.
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "codex-acp-gateway", about)]
 pub struct GatewayConfig {
+    /// Transport endpoint URL. Supported values: `stdio://` (default),
+    /// `ws://IP:PORT`.
+    #[arg(long = "listen", value_name = "URL", default_value = "stdio://")]
+    pub listen: ListenTransport,
+
     /// Command to spawn as the ACP agent (e.g. "gemini").
     #[arg(long)]
     pub agent_cmd: String,
@@ -22,4 +29,43 @@ pub struct GatewayConfig {
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
     pub log_level: String,
+}
+
+/// Transport mode for the Codex client side.
+#[derive(Debug, Clone)]
+pub enum ListenTransport {
+    /// Read/write Codex NDJSON over stdin/stdout.
+    Stdio,
+    /// Accept WebSocket connections on the given address.
+    WebSocket { bind_address: SocketAddr },
+}
+
+impl FromStr for ListenTransport {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "stdio://" {
+            return Ok(Self::Stdio);
+        }
+
+        if let Some(addr_str) = s.strip_prefix("ws://") {
+            let bind_address = addr_str.parse::<SocketAddr>().map_err(|_| {
+                format!("invalid WebSocket listen URL: {s:?} (expected 'ws://IP:PORT', e.g. 'ws://0.0.0.0:8080')")
+            })?;
+            return Ok(Self::WebSocket { bind_address });
+        }
+
+        Err(format!(
+            "unsupported listen URL: {s:?} (expected 'stdio://' or 'ws://IP:PORT')"
+        ))
+    }
+}
+
+impl std::fmt::Display for ListenTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdio => write!(f, "stdio://"),
+            Self::WebSocket { bind_address } => write!(f, "ws://{bind_address}"),
+        }
+    }
 }

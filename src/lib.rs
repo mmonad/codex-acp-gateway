@@ -9,12 +9,13 @@ use std::rc::Rc;
 use agent_client_protocol::{Agent, ClientSideConnection};
 use anyhow::{Context, Result};
 use codex_app_server_protocol::{JSONRPCMessage, JSONRPCRequest, JSONRPCResponse};
+use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::acp::AcpEvent;
-use crate::config::GatewayConfig;
+use crate::config::{GatewayConfig, ListenTransport};
 use crate::error::GatewayError;
 use crate::translation::acp_to_codex;
 use crate::translation::approval;
@@ -24,92 +25,153 @@ use crate::translation::state::{GatewayState, SessionLifecycle};
 use crate::transport::TransportEvent;
 use crate::transport::outgoing::OutgoingMessageSender;
 use crate::transport::stdio;
+use crate::transport::websocket;
 
 /// Run the gateway. This is the main entry point called from `main()`.
 ///
-/// Sets up the Codex transport, spawns the ACP agent subprocess, and runs the
-/// event loop that translates between the two protocols.
+/// Dispatches to the appropriate transport mode based on `config.listen`:
+/// - **Stdio**: single client, exit on EOF (original behavior)
+/// - **WebSocket**: accept connections on a TCP port, each gets its own ACP subprocess
+///
+/// All work runs inside a `LocalSet` because ACP futures are `!Send`.
 pub async fn run(config: GatewayConfig) -> Result<()> {
     let cwd = std::fs::canonicalize(&config.cwd).context("invalid cwd")?;
     info!(
+        listen = %config.listen,
         agent_cmd = %config.agent_cmd,
         agent_args = ?config.agent_args,
         cwd = %cwd.display(),
         "starting codex-acp-gateway"
     );
 
-    // -- Codex transport channels --
-    let (codex_inbound_tx, mut codex_inbound_rx) = mpsc::channel::<TransportEvent>(256);
-    let (codex_outbound_tx, codex_outbound_rx) = mpsc::channel::<String>(256);
-
-    // Spawn the Codex stdio reader/writer (Send tasks, normal tokio::spawn)
-    stdio::spawn_reader(codex_inbound_tx);
-    stdio::spawn_writer(codex_outbound_rx);
-
-    let outgoing = OutgoingMessageSender::new(codex_outbound_tx);
-
-    // -- ACP connection (must run on LocalSet because of !Send futures) --
     let local = tokio::task::LocalSet::new();
     local
-        .run_until(async move {
-            let (acp_conn, mut acp_events) =
-                acp::connect(&config.agent_cmd, &config.agent_args, &cwd)
-                    .await
-                    .context("failed to connect to ACP agent")?;
+        .run_until(async {
+            match &config.listen {
+                ListenTransport::Stdio => {
+                    let (inbound_tx, inbound_rx) = mpsc::channel::<TransportEvent>(256);
+                    let (outbound_tx, outbound_rx) = mpsc::channel::<String>(256);
 
-            let mut state = GatewayState::new();
-            let mut id_map = IdMap::new();
-            // Wrap in Rc so we can clone into spawn_local tasks
-            let agent = Rc::new(acp_conn.agent);
+                    stdio::spawn_reader(inbound_tx);
+                    stdio::spawn_writer(outbound_rx);
 
-            info!("gateway event loop started");
+                    run_session(&config, &cwd, inbound_rx, outbound_tx).await
+                }
+                ListenTransport::WebSocket { bind_address } => {
+                    let listener = tokio::net::TcpListener::bind(bind_address)
+                        .await
+                        .with_context(|| {
+                            format!("failed to bind WebSocket listener on {bind_address}")
+                        })?;
+                    info!(%bind_address, "listening for WebSocket connections");
 
-            // -- Main event loop: multiplex Codex inbound + ACP events --
-            loop {
-                tokio::select! {
-                    // Codex client sent us a message
-                    event = codex_inbound_rx.recv() => {
-                        match event {
-                            Some(TransportEvent::MessageReceived { message }) => {
-                                handle_codex_message(
-                                    message,
-                                    &agent,
-                                    &outgoing,
-                                    &mut state,
-                                    &mut id_map,
-                                    &cwd,
-                                ).await;
+                    loop {
+                        let (tcp_stream, peer_addr) = listener.accept().await?;
+                        debug!(%peer_addr, "TCP connection accepted");
+
+                        let ws_stream =
+                            match tokio_tungstenite::accept_async(tcp_stream).await {
+                                Ok(ws) => ws,
+                                Err(e) => {
+                                    warn!(%peer_addr, "WebSocket handshake failed: {e}");
+                                    continue;
+                                }
+                            };
+
+                        info!(%peer_addr, "WebSocket client connected");
+                        let (ws_write, ws_read) = ws_stream.split();
+
+                        let (inbound_tx, inbound_rx) = mpsc::channel::<TransportEvent>(256);
+                        let (outbound_tx, outbound_rx) = mpsc::channel::<String>(256);
+                        let (pong_tx, pong_rx) = mpsc::channel::<Vec<u8>>(16);
+
+                        websocket::spawn_reader(inbound_tx, ws_read, pong_tx);
+                        websocket::spawn_writer(outbound_rx, ws_write, pong_rx);
+
+                        let cfg = config.clone();
+                        let cwd = cwd.clone();
+                        tokio::task::spawn_local(async move {
+                            if let Err(e) =
+                                run_session(&cfg, &cwd, inbound_rx, outbound_tx).await
+                            {
+                                warn!(%peer_addr, "session error: {e:#}");
                             }
-                            Some(TransportEvent::Disconnected) | None => {
-                                info!("codex client disconnected, shutting down");
-                                break;
-                            }
-                        }
+                            info!(%peer_addr, "session ended");
+                        });
                     }
+                }
+            }
+        })
+        .await
+}
 
-                    // ACP agent sent us a notification or permission request
-                    event = acp_events.recv() => {
-                        match event {
-                            Some(acp_event) => {
-                                handle_acp_event(
-                                    acp_event,
-                                    &outgoing,
-                                    &mut state,
-                                    &mut id_map,
-                                ).await;
-                            }
-                            None => {
-                                info!("ACP event channel closed, agent likely exited");
-                                break;
-                            }
-                        }
+/// Run one gateway session for a single Codex client connection.
+///
+/// Spawns an ACP agent subprocess and runs the event loop that translates
+/// between the Codex transport channels and the ACP connection.
+///
+/// This function is transport-agnostic — it only uses `mpsc` channels. Must be
+/// called from within a `LocalSet` (ACP futures are `!Send`).
+async fn run_session(
+    config: &GatewayConfig,
+    cwd: &std::path::Path,
+    mut codex_inbound_rx: mpsc::Receiver<TransportEvent>,
+    codex_outbound_tx: mpsc::Sender<String>,
+) -> Result<()> {
+    let outgoing = OutgoingMessageSender::new(codex_outbound_tx);
+
+    let (acp_conn, mut acp_events) =
+        acp::connect(&config.agent_cmd, &config.agent_args, cwd)
+            .await
+            .context("failed to connect to ACP agent")?;
+
+    let mut state = GatewayState::new();
+    let mut id_map = IdMap::new();
+    let agent = Rc::new(acp_conn.agent);
+
+    info!("gateway event loop started");
+
+    loop {
+        tokio::select! {
+            event = codex_inbound_rx.recv() => {
+                match event {
+                    Some(TransportEvent::MessageReceived { message }) => {
+                        handle_codex_message(
+                            message,
+                            &agent,
+                            &outgoing,
+                            &mut state,
+                            &mut id_map,
+                            cwd,
+                        ).await;
+                    }
+                    Some(TransportEvent::Disconnected) | None => {
+                        info!("codex client disconnected, shutting down");
+                        break;
                     }
                 }
             }
 
-            Ok(())
-        })
-        .await
+            event = acp_events.recv() => {
+                match event {
+                    Some(acp_event) => {
+                        handle_acp_event(
+                            acp_event,
+                            &outgoing,
+                            &mut state,
+                            &mut id_map,
+                        ).await;
+                    }
+                    None => {
+                        info!("ACP event channel closed, agent likely exited");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle an incoming JSON-RPC message from the Codex client.

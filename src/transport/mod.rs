@@ -1,5 +1,6 @@
 pub mod outgoing;
 pub mod stdio;
+pub mod websocket;
 
 use codex_app_server_protocol::JSONRPCMessage;
 

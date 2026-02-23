@@ -5,14 +5,15 @@ from __future__ import annotations
 import json
 import os
 import select
+import socket
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
 from typing import Optional
 
 import pytest
+import websocket as ws_client
 
 # ── Paths ────────────────────────────────────────────────────
 
@@ -82,93 +83,54 @@ def _log_recv(msg: dict):
         _log(f"  <<< {method}{extra}", DIM)
 
 
-# ── GatewaySession ───────────────────────────────────────────
+# ── Networking helpers ───────────────────────────────────────
 
 
-@dataclass
-class GatewaySession:
-    """Manages a gateway subprocess and Codex protocol communication."""
+def _find_free_port() -> int:
+    """Find an available TCP port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
-    proc: subprocess.Popen
-    _stderr_thread: Optional[threading.Thread] = None
-    _next_id: int = 1
-    stderr_lines: list = field(default_factory=list)
 
-    # ── lifecycle ────────────────────────────────────────────
+# ── Shared stderr reader ─────────────────────────────────────
 
-    @classmethod
-    def start(
-        cls,
-        agent_cmd: str = "gemini",
-        agent_args: list[str] | None = None,
-        log_level: str = "info",
-    ) -> GatewaySession:
-        if agent_args is None:
-            agent_args = ["--experimental-acp"]
 
-        cmd = [
-            _gateway_bin(),
-            "--agent-cmd",
-            agent_cmd,
-            "--log-level",
-            log_level,
-            "--",
-            *agent_args,
-        ]
+def _start_stderr_reader(proc, stderr_lines: list) -> threading.Thread:
+    """Spawn a daemon thread that drains the process stderr."""
 
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+    def _read():
+        for line in proc.stderr:
+            decoded = line.decode().rstrip()
+            stderr_lines.append(decoded)
+            if any(kw in decoded for kw in ["ERROR", "WARN", "panic"]):
+                _log(f"  [gw] {decoded}", YELLOW)
 
-        session = cls(proc=proc)
+    t = threading.Thread(target=_read, daemon=True)
+    t.start()
+    return t
 
-        def _read_stderr():
-            for line in proc.stderr:
-                decoded = line.decode().rstrip()
-                session.stderr_lines.append(decoded)
-                if any(kw in decoded for kw in ["ERROR", "WARN", "panic"]):
-                    _log(f"  [gw] {decoded}", YELLOW)
 
-        t = threading.Thread(target=_read_stderr, daemon=True)
-        t.start()
-        session._stderr_thread = t
+# ── Protocol mixin ───────────────────────────────────────────
 
-        # Give the gateway + agent a moment to initialise
-        time.sleep(2)
-        return session
 
-    def close(self):
-        self.proc.stdin.close()
-        try:
-            self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait()
+class _ProtocolMixin:
+    """Codex protocol helpers shared by stdio and WebSocket sessions.
 
-    # ── low-level I/O ────────────────────────────────────────
+    Subclasses must implement ``send(msg)`` and ``recv(timeout)`` for their
+    transport layer.
+    """
+
+    _next_id: int
+    stderr_lines: list
 
     def send(self, msg: dict):
-        """Send a Codex protocol message (NDJSON line)."""
-        _log_send(msg)
-        line = json.dumps(msg, separators=(",", ":")) + "\n"
-        self.proc.stdin.write(line.encode())
-        self.proc.stdin.flush()
+        raise NotImplementedError
 
     def recv(self, timeout: float = 30) -> Optional[dict]:
-        """Read one NDJSON message from gateway stdout."""
-        ready, _, _ = select.select([self.proc.stdout], [], [], timeout)
-        if ready:
-            raw = self.proc.stdout.readline()
-            if raw:
-                msg = json.loads(raw.decode().strip())
-                _log_recv(msg)
-                return msg
-        return None
+        raise NotImplementedError
 
-    # ── protocol helpers ─────────────────────────────────────
+    # ── protocol helpers ──────────────────────────────────────
 
     def send_request(self, method: str, params: dict | None = None) -> int:
         """Send a request and return its ID."""
@@ -274,7 +236,7 @@ class GatewaySession:
 
         return result
 
-    # ── high-level actions ───────────────────────────────────
+    # ── high-level actions ────────────────────────────────────
 
     def initialize(self) -> dict:
         """Perform the full initialize handshake. Returns the result."""
@@ -282,7 +244,7 @@ class GatewaySession:
             "initialize",
             {"clientInfo": {"name": "test-client", "version": "0.0.1"}},
         )
-        resp, _ = self.recv_until_response(req_id, timeout=15)
+        resp, _ = self.recv_until_response(req_id, timeout=30)
         assert resp is not None, "initialize timed out"
         assert "result" in resp, f"initialize failed: {resp.get('error', {})}"
         self.send_notification("initialized")
@@ -313,20 +275,219 @@ class GatewaySession:
         resp, _ = self.recv_until_response(req_id, timeout=10)
         return resp
 
-    # ── convenience ──────────────────────────────────────────
 
-    @property
-    def agent_text(self):
-        """Shortcut — only valid after a collect_turn() call stored results."""
-        raise AttributeError("use the events dict returned by turn_start()")
+# ── GatewaySession (stdio) ───────────────────────────────────
 
 
-# ── Pytest Fixtures ──────────────────────────────────────────
+class GatewaySession(_ProtocolMixin):
+    """Manages a gateway subprocess via stdio (NDJSON on stdin/stdout)."""
+
+    def __init__(self, proc: subprocess.Popen):
+        self.proc = proc
+        self._next_id = 1
+        self.stderr_lines: list = []
+        self._stderr_thread: Optional[threading.Thread] = None
+
+    @classmethod
+    def start(
+        cls,
+        agent_cmd: str = "gemini",
+        agent_args: list[str] | None = None,
+        log_level: str = "info",
+    ) -> GatewaySession:
+        if agent_args is None:
+            agent_args = ["--experimental-acp"]
+
+        cmd = [
+            _gateway_bin(),
+            "--agent-cmd",
+            agent_cmd,
+            "--log-level",
+            log_level,
+            "--",
+            *agent_args,
+        ]
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        session = cls(proc)
+        session._stderr_thread = _start_stderr_reader(proc, session.stderr_lines)
+
+        # Give the gateway + agent a moment to initialise
+        time.sleep(2)
+        return session
+
+    def close(self):
+        self.proc.stdin.close()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+
+    # ── transport I/O ─────────────────────────────────────────
+
+    def send(self, msg: dict):
+        """Send a Codex protocol message (NDJSON line)."""
+        _log_send(msg)
+        line = json.dumps(msg, separators=(",", ":")) + "\n"
+        self.proc.stdin.write(line.encode())
+        self.proc.stdin.flush()
+
+    def recv(self, timeout: float = 30) -> Optional[dict]:
+        """Read one NDJSON message from gateway stdout."""
+        ready, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        if ready:
+            raw = self.proc.stdout.readline()
+            if raw:
+                msg = json.loads(raw.decode().strip())
+                _log_recv(msg)
+                return msg
+        return None
+
+
+# ── WsGatewaySession (WebSocket) ─────────────────────────────
+
+
+class WsGatewaySession(_ProtocolMixin):
+    """Manages a gateway via WebSocket transport.
+
+    Each instance owns one WebSocket connection. If ``_owns_proc`` is True
+    (default when using ``start()``), closing the session also terminates the
+    gateway subprocess.
+    """
+
+    def __init__(
+        self,
+        ws: ws_client.WebSocket,
+        proc: Optional[subprocess.Popen] = None,
+        port: int = 0,
+    ):
+        self.ws = ws
+        self.proc = proc
+        self.port = port
+        self._owns_proc = proc is not None
+        self._next_id = 1
+        self.stderr_lines: list = []
+        self._stderr_thread: Optional[threading.Thread] = None
+
+    @classmethod
+    def start(
+        cls,
+        agent_cmd: str = "gemini",
+        agent_args: list[str] | None = None,
+        log_level: str = "info",
+    ) -> WsGatewaySession:
+        """Start a gateway process in WS mode and connect one client."""
+        if agent_args is None:
+            agent_args = ["--experimental-acp"]
+
+        port = _find_free_port()
+        listen_url = f"ws://127.0.0.1:{port}"
+
+        cmd = [
+            _gateway_bin(),
+            "--listen",
+            listen_url,
+            "--agent-cmd",
+            agent_cmd,
+            "--log-level",
+            log_level,
+            "--",
+            *agent_args,
+        ]
+
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+
+        stderr_lines: list = []
+        stderr_thread = _start_stderr_reader(proc, stderr_lines)
+
+        # Retry WebSocket connection until the gateway is ready.
+        # Using an actual WS handshake instead of a raw TCP probe avoids
+        # triggering spurious "handshake failed" warnings in the gateway.
+        ws = None
+        for _attempt in range(30):
+            try:
+                ws = ws_client.create_connection(listen_url, timeout=2)
+                break
+            except (ConnectionRefusedError, ConnectionResetError, OSError):
+                time.sleep(0.3)
+
+        if ws is None:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(
+                f"Gateway did not start listening on {listen_url} within 10s. "
+                f"stderr: {stderr_lines[-5:]}"
+            )
+
+        session = cls(ws=ws, proc=proc, port=port)
+        session.stderr_lines = stderr_lines
+        session._stderr_thread = stderr_thread
+        return session
+
+    def connect_another(self) -> WsGatewaySession:
+        """Open a second WebSocket connection to the same gateway process.
+
+        The returned session does NOT own the subprocess — closing it only
+        closes the WebSocket connection.
+        """
+        ws = ws_client.create_connection(
+            f"ws://127.0.0.1:{self.port}", timeout=30,
+        )
+        session = WsGatewaySession(ws=ws, proc=None, port=self.port)
+        # Share stderr for logging visibility
+        session.stderr_lines = self.stderr_lines
+        return session
+
+    def close(self):
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+        if self._owns_proc and self.proc is not None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+
+    # ── transport I/O ─────────────────────────────────────────
+
+    def send(self, msg: dict):
+        """Send a Codex protocol message as a WebSocket Text frame."""
+        _log_send(msg)
+        # One JSON per frame — no newline (unlike NDJSON)
+        self.ws.send(json.dumps(msg, separators=(",", ":")))
+
+    def recv(self, timeout: float = 30) -> Optional[dict]:
+        """Receive one JSON-RPC message from the WebSocket."""
+        self.ws.settimeout(timeout)
+        try:
+            data = self.ws.recv()
+            if data:
+                msg = json.loads(data)
+                _log_recv(msg)
+                return msg
+        except ws_client.WebSocketTimeoutException:
+            return None
+        except (ws_client.WebSocketConnectionClosedException, ConnectionError):
+            return None
+        return None
+
+
+# ── Pytest Fixtures: Stdio ───────────────────────────────────
 
 
 @pytest.fixture
 def gateway():
-    """Yield a started GatewaySession, closed automatically after the test."""
+    """Yield a started stdio GatewaySession, closed automatically after the test."""
     gw = GatewaySession.start()
     yield gw
     gw.close()
@@ -342,16 +503,52 @@ def gateway_debug():
 
 @pytest.fixture
 def initialized_gateway(gateway):
-    """A gateway that has already completed the initialize handshake."""
+    """A stdio gateway that has already completed the initialize handshake."""
     gateway.initialize()
     return gateway
 
 
 @pytest.fixture
 def thread(initialized_gateway) -> tuple[GatewaySession, str]:
-    """An initialized gateway with one thread already created.
+    """An initialized stdio gateway with one thread already created.
 
     Returns ``(gateway, thread_id)``.
     """
     thread_id = initialized_gateway.thread_start()
     return initialized_gateway, thread_id
+
+
+# ── Pytest Fixtures: WebSocket ───────────────────────────────
+
+
+@pytest.fixture
+def ws_gateway():
+    """Yield a started WsGatewaySession, closed automatically after the test."""
+    gw = WsGatewaySession.start()
+    yield gw
+    gw.close()
+
+
+@pytest.fixture
+def ws_gateway_debug():
+    """Same as ws_gateway but with debug logging."""
+    gw = WsGatewaySession.start(log_level="debug")
+    yield gw
+    gw.close()
+
+
+@pytest.fixture
+def ws_initialized_gateway(ws_gateway):
+    """A WS gateway that has already completed the initialize handshake."""
+    ws_gateway.initialize()
+    return ws_gateway
+
+
+@pytest.fixture
+def ws_thread(ws_initialized_gateway) -> tuple[WsGatewaySession, str]:
+    """An initialized WS gateway with one thread already created.
+
+    Returns ``(gateway, thread_id)``.
+    """
+    thread_id = ws_initialized_gateway.thread_start()
+    return ws_initialized_gateway, thread_id

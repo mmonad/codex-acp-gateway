@@ -38,19 +38,39 @@ Requires Rust 2024 edition (1.85+).
 ## Usage
 
 ```bash
-# Launch the gateway with an ACP agent command
-codex-acp-gateway --agent-cmd <agent-binary> [agent-args...]
+# Stdio mode (default) — pipe Codex protocol on stdin/stdout
+codex-acp-gateway --agent-cmd <agent-binary> [-- agent-args...]
+
+# WebSocket mode — accept Codex clients over WebSocket
+codex-acp-gateway --listen ws://0.0.0.0:8080 --agent-cmd <agent-binary> [-- agent-args...]
 
 # Example: use a Gemini ACP agent with Codex CLI
 codex-acp-gateway --agent-cmd gemini -- --experimental-acp
 ```
 
-The gateway reads Codex protocol messages from stdin and writes responses to
-stdout. The ACP agent is spawned as a child process; the gateway communicates
-with it via its stdin/stdout.
+### Transport modes
 
-Pass `--agent-cmd` to specify the agent binary. Everything after `--` is
-forwarded as arguments to the agent process.
+The `--listen` flag controls how Codex clients connect to the gateway:
+
+| Value              | Behavior                                             |
+|--------------------|------------------------------------------------------|
+| `stdio://` (default) | Read/write Codex NDJSON on stdin/stdout. Single client, exit on EOF. |
+| `ws://IP:PORT`     | Accept WebSocket connections. Each client gets its own ACP agent subprocess. |
+
+In stdio mode, the gateway reads Codex protocol messages from stdin and writes
+responses to stdout.
+
+In WebSocket mode, the gateway listens for connections on the given address.
+Each connected client gets an independent ACP agent subprocess — there is no
+shared state between connections.
+
+### Options
+
+- `--agent-cmd` — path or name of the ACP agent binary to spawn
+- `--listen <URL>` — transport endpoint (`stdio://` or `ws://IP:PORT`)
+- `--cwd <PATH>` — working directory for the agent subprocess (default: `.`)
+- `--log-level <LEVEL>` — `trace`, `debug`, `info`, `warn`, `error` (default: `info`)
+- Everything after `--` is forwarded as arguments to the agent process
 
 ## Protocol mapping
 
@@ -85,7 +105,7 @@ codex-acp-gateway/
     main.rs                   Entry point, CLI parsing, runtime setup
     config.rs                 CLI args and configuration
     error.rs                  Gateway error types
-    transport/                Codex-side stdio NDJSON transport
+    transport/                Codex-side transport (stdio NDJSON + WebSocket)
     acp/                      ACP subprocess management + Client trait impl
     translation/              Bidirectional protocol translation engine
   crates/                     Vendored from codex, maintained locally
@@ -105,6 +125,7 @@ codex-acp-gateway/
 - **tokio** -- async runtime (full features)
 - **serde** / **serde_json** -- serialization
 - **clap** -- CLI argument parsing
+- **tokio-tungstenite** -- WebSocket transport
 - **tracing** -- structured logging
 - **uuid** v7 -- correlation IDs
 
