@@ -31,7 +31,7 @@ codex-file-search = { path = "crates/file-search" }
 codex-utils-image = { path = "crates/utils/image" }
 
 # ACP protocol
-agent-client-protocol = "0.9"
+agent-client-protocol = { version = "0.9", features = ["unstable"] }
 
 # External (versions from codex workspace)
 anyhow = "1"

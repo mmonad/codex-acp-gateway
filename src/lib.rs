@@ -275,13 +275,11 @@ async fn handle_codex_request(
                 .collect();
             Ok(json!({ "data": loaded, "nextCursor": null }))
         }
-        "thread/list" => handle_thread_list(&params, state).await,
+        "thread/list" => handle_thread_list(&params, agent.as_ref(), state).await,
         "thread/read" => handle_thread_read(&params, state).await,
         "thread/fork" => handle_thread_fork(&params, agent.as_ref(), state, id_map, cwd).await,
         "thread/rollback" => handle_thread_rollback(&params, agent.as_ref(), state, id_map, cwd).await,
-        "model/list" => {
-            Ok(json!({ "data": [{ "id": "acp-agent", "name": "ACP Agent" }], "nextCursor": null }))
-        }
+        "model/list" => handle_model_list(state),
 
         // Stub handlers — return empty/default responses
         "config/read" => Ok(json!({ "config": {}, "layers": [] })),
@@ -422,7 +420,26 @@ async fn handle_thread_start(
         },
     );
 
+    // Store model state from the agent if available.
+    if let Some(models) = acp_resp.models {
+        state.model_state = Some(models);
+    }
+
     info!(%thread_id, %session_id, "thread/session created");
+
+    // If the client requested a specific model and the agent supports model
+    // selection, attempt to set it. This is best-effort — failure doesn't
+    // block thread creation.
+    if let Some(model) = params.get("model").and_then(|v| v.as_str()) {
+        let has_models = state.model_state.is_some();
+        if has_models {
+            let model_req = codex_to_acp::translate_set_session_model(&session_id, model);
+            match agent.set_session_model(model_req).await {
+                Ok(_) => info!(%thread_id, %model, "session model set"),
+                Err(e) => debug!(%thread_id, %model, "set_session_model failed (non-fatal): {e:?}"),
+            }
+        }
+    }
 
     // Build SessionMetaLine for the rollout recorder.
     let now_str = OffsetDateTime::now_utc()
@@ -571,6 +588,16 @@ async fn handle_turn_start(
     tokio::task::spawn_local(async move {
         let succeeded = match agent.prompt(acp_req).await {
             Ok(resp) => {
+                // Emit token usage notification if the agent provided usage data.
+                if let Some(ref usage) = resp.usage {
+                    let (method, params) = acp_to_codex::translate_prompt_usage(
+                        usage,
+                        &thread_id_owned,
+                        &turn_id_clone,
+                    );
+                    let _ = outgoing_clone.send_notification(method, Some(params)).await;
+                }
+
                 let stop_reason = format!("{:?}", resp.stop_reason);
                 let (method, params) = acp_to_codex::translate_prompt_response(
                     &stop_reason,
@@ -699,17 +726,37 @@ async fn handle_thread_resume(
 
     state.set_lifecycle(thread_id.to_string(), SessionLifecycle::Loading);
 
-    let acp_req = codex_to_acp::translate_thread_resume(params, &session_id, cwd);
-    let acp_resp = agent
-        .load_session(acp_req)
-        .await
-        .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
+    // Check if the agent supports the unstable session/resume method (skips
+    // replaying message history). Fall back to session/load if not supported.
+    let supports_resume = state
+        .agent_capabilities
+        .as_ref()
+        .and_then(|c| c.session_capabilities.resume.as_ref())
+        .is_some();
+
+    let (modes, config) = if supports_resume {
+        let acp_req =
+            codex_to_acp::translate_thread_resume_session(params, &session_id, cwd);
+        let acp_resp = agent
+            .resume_session(acp_req)
+            .await
+            .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
+        info!(%thread_id, "used ACP session/resume (no history replay)");
+        (acp_resp.modes, acp_resp.config_options)
+    } else {
+        let acp_req = codex_to_acp::translate_thread_resume(params, &session_id, cwd);
+        let acp_resp = agent
+            .load_session(acp_req)
+            .await
+            .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
+        (acp_resp.modes, acp_resp.config_options)
+    };
 
     // Store modes and config from the response.
-    if let Some(modes) = acp_resp.modes {
+    if let Some(modes) = modes {
         state.session_modes.insert(session_id.clone(), modes);
     }
-    if let Some(config) = acp_resp.config_options {
+    if let Some(config) = config {
         state.session_config.insert(session_id.clone(), config);
     }
 
@@ -724,6 +771,15 @@ async fn handle_thread_resume(
             session_id: session_id.clone(),
         },
     );
+
+    // If the client requested a specific model, attempt to set it.
+    if let Some(model) = params.get("model").and_then(|v| v.as_str()) {
+        let model_req = codex_to_acp::translate_set_session_model(&session_id, model);
+        match agent.set_session_model(model_req).await {
+            Ok(_) => info!(%thread_id, %model, "session model set on resume"),
+            Err(e) => debug!(%thread_id, %model, "set_session_model on resume failed (non-fatal): {e:?}"),
+        }
+    }
 
     info!(%thread_id, %session_id, "thread/session resumed");
 
@@ -857,9 +913,12 @@ async fn handle_set_session_config_option(
 /// Handle `thread/list` — return persisted threads from rollout files.
 ///
 /// Uses the vendored `rollout::list::get_threads()` for paginated listing
-/// with proper Codex-compatible Thread JSON.
+/// with proper Codex-compatible Thread JSON. When the agent supports the
+/// unstable `session/list` method, agent-known sessions that don't have
+/// local rollout files are appended to the listing.
 async fn handle_thread_list(
     params: &Value,
+    agent: &(impl Agent + ?Sized),
     state: &GatewayState,
 ) -> Result<Value, GatewayError> {
     use crate::rollout::list::{self, ThreadSortKey, parse_cursor};
@@ -903,7 +962,7 @@ async fn handle_thread_list(
         .await
         .unwrap_or_default();
 
-    let data: Vec<Value> = page
+    let mut data: Vec<Value> = page
         .items
         .iter()
         .map(|item| {
@@ -914,6 +973,52 @@ async fn handle_thread_list(
             build_thread_json_from_list_item(item, name, &state.threads)
         })
         .collect();
+
+    // If the agent supports session/list, query it to find sessions we may
+    // not have local rollout files for (e.g. from a previous gateway run).
+    let supports_list = state
+        .agent_capabilities
+        .as_ref()
+        .and_then(|c| c.session_capabilities.list.as_ref())
+        .is_some();
+
+    if supports_list && cursor.is_none() {
+        // Only query agent on the first page (no cursor) to avoid complexity.
+        let mut list_req = agent_client_protocol::ListSessionsRequest::new();
+        if let Some(cwd_str) = params.get("cwd").and_then(|v| v.as_str()) {
+            list_req = list_req.cwd(std::path::PathBuf::from(cwd_str));
+        }
+        if let Ok(list_resp) = agent.list_sessions(list_req).await {
+            // Collect IDs we already have locally (owned to avoid borrow conflict).
+            let known_ids: std::collections::HashSet<String> = data
+                .iter()
+                .filter_map(|v| v.get("id").and_then(|id| id.as_str()).map(String::from))
+                .collect();
+
+            for session_info in &list_resp.sessions {
+                let sid = session_info.session_id.to_string();
+                if known_ids.contains(&sid) {
+                    continue; // Already have this thread locally
+                }
+                let updated = session_info.updated_at.as_deref()
+                    .and_then(parse_rfc3339_to_unix)
+                    .unwrap_or(0);
+                data.push(json!({
+                    "id": sid,
+                    "preview": "",
+                    "modelProvider": "acp",
+                    "createdAt": updated,
+                    "updatedAt": updated,
+                    "status": { "type": "notLoaded" },
+                    "cwd": session_info.cwd.to_string_lossy(),
+                    "cliVersion": "",
+                    "source": "appServer",
+                    "name": session_info.title,
+                    "turns": [],
+                }));
+            }
+        }
+    }
 
     let next_cursor = page.next_cursor.and_then(|c| serde_json::to_value(c).ok());
 
@@ -1095,15 +1200,44 @@ async fn handle_thread_fork(
         state.rollout.record_item(&new_thread_id, item.clone());
     }
 
-    // Build fork params for ACP session creation, using the fork's cwd.
-    let acp_params = json!({ "cwd": fork_cwd.to_string_lossy() });
-    let acp_req = codex_to_acp::translate_thread_start(&acp_params, &fork_cwd);
-    let acp_resp = agent
-        .new_session(acp_req)
-        .await
-        .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
+    // Check if the agent supports the unstable session/fork method.
+    // If so, delegate to the agent (it preserves internal conversation context).
+    // Otherwise fall back to creating a new session.
+    let supports_fork = state
+        .agent_capabilities
+        .as_ref()
+        .and_then(|c| c.session_capabilities.fork.as_ref())
+        .is_some();
 
-    let session_id = acp_resp.session_id.to_string();
+    let source_session_id = id_map.lookup_session(source_thread_id).cloned();
+
+    let session_id = if let (true, Some(src_sid)) = (supports_fork, source_session_id) {
+        let acp_req = codex_to_acp::translate_thread_fork_session(params, &src_sid, &fork_cwd);
+        let acp_resp = agent
+            .fork_session(acp_req)
+            .await
+            .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
+        let sid = acp_resp.session_id.to_string();
+        if let Some(modes) = acp_resp.modes {
+            state.session_modes.insert(sid.clone(), modes);
+        }
+        if let Some(config) = acp_resp.config_options {
+            state.session_config.insert(sid.clone(), config);
+        }
+        info!(%new_thread_id, session_id = %sid, source = %source_thread_id, "thread forked via ACP session/fork");
+        sid
+    } else {
+        let acp_params = json!({ "cwd": fork_cwd.to_string_lossy() });
+        let acp_req = codex_to_acp::translate_thread_start(&acp_params, &fork_cwd);
+        let acp_resp = agent
+            .new_session(acp_req)
+            .await
+            .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
+        let sid = acp_resp.session_id.to_string();
+        info!(%new_thread_id, session_id = %sid, source = %source_thread_id, "thread forked (new session fallback)");
+        sid
+    };
+
     id_map.create_thread_session_mapping(new_thread_id.clone(), session_id.clone());
     state.set_lifecycle(
         new_thread_id.clone(),
@@ -1111,8 +1245,6 @@ async fn handle_thread_fork(
             session_id: session_id.clone(),
         },
     );
-
-    info!(%new_thread_id, %session_id, source = %source_thread_id, "thread forked");
 
     // Build turns from all items (including copied ones) for the response.
     let turns = build_turns_from_rollout_items(&items);
@@ -1418,19 +1550,33 @@ async fn handle_acp_event(
                 _ => "unknown-turn".to_string(),
             };
 
+            // If the agent sent a SessionInfoUpdate with a title, persist it to
+            // the session index so thread/list picks it up.
+            if let agent_client_protocol::SessionUpdate::SessionInfoUpdate(ref info) = notif.update
+                && let agent_client_protocol::MaybeUndefined::Value(ref title) = info.title
+                && let Ok(tid) = codex_protocol::ThreadId::from_string(&thread_id)
+            {
+                let home = state.rollout.gateway_home().to_path_buf();
+                let title = title.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(e) = crate::rollout::session_index::append_thread_name(
+                        &home, tid, &title,
+                    )
+                    .await
+                    {
+                        warn!("failed to persist agent-provided title: {e}");
+                    }
+                });
+            }
+
             let result =
                 acp_to_codex::translate_session_update(&notif.update, &thread_id, &turn_id, id_map);
 
             for (method, params) in result.notifications {
-                // TODO(task3): map each notification to the proper EventMsg/RolloutItem
-                // and call state.rollout.record_item(&thread_id, item).
                 if let Err(e) = outgoing.send_notification(&method, Some(params)).await {
                     warn!(method, "failed to send notification: {e}");
                 }
             }
-
-            // TODO: emit thread/tokenUsage/updated notification once ACP reports
-            // token usage data in session updates (not currently available).
 
             // Accumulate diffs and emit turn/diff/updated aggregate notification
             if !result.diffs.is_empty() {
@@ -1768,6 +1914,33 @@ async fn handle_thread_unarchive(
             "turns": [],
         },
     }))
+}
+
+/// Handle `model/list` — return available models from the agent if known.
+///
+/// Uses the agent's `SessionModelState` from the last session creation/load
+/// response. Falls back to a generic "acp-agent" entry if the agent doesn't
+/// advertise model selection.
+fn handle_model_list(state: &GatewayState) -> Result<Value, GatewayError> {
+    // Check if we have model state from the agent's last session response.
+    // The model state is stored when `NewSessionResponse.models` or
+    // `LoadSessionResponse.models` is `Some`.
+    if let Some(ref model_state) = state.model_state {
+        let data: Vec<Value> = model_state
+            .available_models
+            .iter()
+            .map(|m| {
+                json!({
+                    "id": m.model_id.0.as_ref(),
+                    "name": m.name,
+                    "description": m.description,
+                })
+            })
+            .collect();
+        return Ok(json!({ "data": data, "nextCursor": null }));
+    }
+
+    Ok(json!({ "data": [{ "id": "acp-agent", "name": "ACP Agent" }], "nextCursor": null }))
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────

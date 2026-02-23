@@ -58,12 +58,18 @@ pub struct TerminalManager {
     next_id: u64,
 }
 
-impl TerminalManager {
-    pub fn new() -> Self {
+impl Default for TerminalManager {
+    fn default() -> Self {
         Self {
             terminals: HashMap::new(),
             next_id: 1,
         }
+    }
+}
+
+impl TerminalManager {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Spawn a new terminal process and return its ID.
@@ -236,10 +242,10 @@ impl TerminalManager {
 
     /// Kill the process (if running) and remove the terminal from the map.
     pub async fn release(&mut self, terminal_id: &str) -> Result<()> {
-        if let Some(mut term) = self.terminals.remove(terminal_id) {
-            if term.exit_status.lock().await.is_none() {
-                let _ = term.child.kill().await;
-            }
+        if let Some(mut term) = self.terminals.remove(terminal_id)
+            && term.exit_status.lock().await.is_none()
+        {
+            let _ = term.child.kill().await;
         }
         Ok(())
     }

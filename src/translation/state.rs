@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use agent_client_protocol::{AgentCapabilities, AuthMethod, SessionConfigOption, SessionModeState};
+use agent_client_protocol::{
+    AgentCapabilities, AuthMethod, SessionConfigOption, SessionModelState, SessionModeState,
+};
 
 use crate::rollout::recorder::RolloutRecorder;
 
@@ -43,6 +45,9 @@ pub struct GatewayState {
     /// Accumulated file diffs per turn (keyed by turn ID).
     /// Each entry is `(path, old_text, new_text)`.
     pub turn_diffs: HashMap<String, Vec<(PathBuf, Option<String>, String)>>,
+    /// Agent's model selection state, populated from session creation/load
+    /// responses when the agent advertises `unstable_session_model` support.
+    pub model_state: Option<SessionModelState>,
     /// Rollout recorder for persisting thread history to disk.
     /// Uses Codex-compatible `RolloutLine`/`RolloutItem` NDJSON format.
     pub rollout: RolloutRecorder,
@@ -60,6 +65,7 @@ impl GatewayState {
             session_modes: HashMap::new(),
             session_config: HashMap::new(),
             turn_diffs: HashMap::new(),
+            model_state: None,
             rollout: RolloutRecorder::default(),
         }
     }

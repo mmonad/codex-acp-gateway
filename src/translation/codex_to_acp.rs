@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use agent_client_protocol::{
-    ClientCapabilities, ContentBlock, FileSystemCapability, InitializeRequest, LoadSessionRequest,
-    NewSessionRequest, PromptRequest, ProtocolVersion, SetSessionConfigOptionRequest,
+    ClientCapabilities, ContentBlock, FileSystemCapability, ForkSessionRequest, InitializeRequest,
+    LoadSessionRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
+    ResumeSessionRequest, SetSessionConfigOptionRequest, SetSessionModelRequest,
     SetSessionModeRequest, TextContent,
 };
 use serde_json::Value;
@@ -82,6 +83,50 @@ pub fn translate_thread_resume(
         .unwrap_or_else(|| fallback_cwd.to_path_buf());
 
     LoadSessionRequest::new(session_id.to_string(), cwd)
+}
+
+/// Translate a Codex `thread/resume` into an ACP `ResumeSessionRequest` (unstable).
+///
+/// Unlike `LoadSessionRequest`, `ResumeSessionRequest` does not replay message
+/// history to the client — the agent picks up where it left off.
+pub fn translate_thread_resume_session(
+    params: &Value,
+    session_id: &str,
+    fallback_cwd: &Path,
+) -> ResumeSessionRequest {
+    let cwd = params
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fallback_cwd.to_path_buf());
+
+    ResumeSessionRequest::new(session_id.to_string(), cwd)
+}
+
+/// Translate a Codex `thread/fork` into an ACP `ForkSessionRequest` (unstable).
+///
+/// Delegates forking to the agent so it preserves its internal conversation
+/// context, rather than the gateway copying rollout items + creating a new session.
+pub fn translate_thread_fork_session(
+    params: &Value,
+    session_id: &str,
+    fallback_cwd: &Path,
+) -> ForkSessionRequest {
+    let cwd = params
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fallback_cwd.to_path_buf());
+
+    ForkSessionRequest::new(session_id.to_string(), cwd)
+}
+
+/// Create an ACP `SetSessionModelRequest` (unstable).
+///
+/// Called when a Codex `thread/start` or `thread/resume` includes a `model`
+/// field and the agent advertises model selection support.
+pub fn translate_set_session_model(session_id: &str, model_id: &str) -> SetSessionModelRequest {
+    SetSessionModelRequest::new(session_id.to_string(), model_id.to_string())
 }
 
 /// Translate into an ACP `SetSessionModeRequest`.

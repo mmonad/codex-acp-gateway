@@ -9,12 +9,12 @@
 |------|-------------|-----|-------|
 | Codex client requests (v2) | 28 of 36 | 8 | Account, remote skills, steer/review |
 | Codex server requests | 2 of 5 | 3 | Tool input, dynamic tool call, token refresh |
-| Codex server notifications | 19 of ~35 | ~16 | Account, config, usage, terminal notifications |
+| Codex server notifications | 20 of ~35 | ~15 | Account, config, terminal notifications |
 | ACP Agent trait (stable) | 8 of 8 | 0 | Full coverage |
-| ACP Agent trait (unstable) | 0 of 4 | 4 | Feature-gated session methods |
+| ACP Agent trait (unstable) | 4 of 4 | 0 | Full coverage (feature-gated) |
 | ACP Client trait | 11 of 11 | 0 | Full coverage |
 | ACP SessionUpdate (stable) | 9 of 9 | 0 | Full coverage |
-| ACP SessionUpdate (unstable) | 0 of 2 | 2 | SessionInfoUpdate, UsageUpdate |
+| ACP SessionUpdate (unstable) | 2 of 2 | 0 | Full coverage (feature-gated) |
 
 ---
 
@@ -60,7 +60,6 @@
 
 | Wire method | Priority | Notes |
 |---|---|---|
-| `thread/tokenUsage/updated` | Medium | Blocked on ACP `UsageUpdate` (RFD in Draft as of Jan 2026) |
 | `thread/compacted` | Low | Context compaction notification |
 | `item/plan/delta` | Low | Incremental plan text delta (we use `turn/plan/updated` instead) |
 | `item/commandExecution/terminalInteraction` | Low | Terminal interaction events |
@@ -82,23 +81,26 @@
 
 ---
 
-## 4. ACP Unstable Methods — Not Implemented
+## 4. ACP Unstable Methods — Implemented
 
-| ACP method | Feature flag | Notes |
-|---|---|---|
-| `session/set_model` | `unstable_session_model` | Change model mid-session |
-| `session/list` | `unstable_session_list` | List agent's sessions |
-| `session/fork` | `unstable_session_fork` | Fork session (maps to `thread/fork`) |
-| `session/resume` | `unstable_session_resume` | Resume without replay |
+All ACP unstable agent methods are now implemented behind `features = ["unstable"]`.
+The gateway checks agent capabilities at runtime and falls back gracefully.
+
+| ACP method | Feature flag | Codex mapping | Notes |
+|---|---|---|---|
+| `session/set_model` | `unstable_session_model` | `thread/start`, `thread/resume` model param | Best-effort model selection after session creation |
+| `session/list` | `unstable_session_list` | `thread/list` supplement | Agent sessions appended to local rollout listing |
+| `session/fork` | `unstable_session_fork` | `thread/fork` delegation | Uses agent's fork when supported; fallback to local copy |
+| `session/resume` | `unstable_session_resume` | `thread/resume` optimization | Skips history replay; fallback to `session/load` |
 
 ---
 
-## 5. ACP Unstable SessionUpdate Variants — Not Implemented
+## 5. ACP Unstable SessionUpdate Variants — Implemented
 
-| SessionUpdate variant | Feature flag | Notes |
-|---|---|---|
-| `SessionInfoUpdate` | `unstable_session_info_update` | Session title/timestamp updates |
-| `UsageUpdate` | `unstable_session_usage` | Token usage / cost updates (RFD in Draft) |
+| SessionUpdate variant | Feature flag | Codex notification | Notes |
+|---|---|---|---|
+| `SessionInfoUpdate` | `unstable_session_info_update` | `thread/name/updated` | Agent-provided title persisted to session index |
+| `UsageUpdate` | `unstable_session_usage` | `thread/tokenUsage/updated` | Mid-turn streaming + final `PromptResponse.usage` |
 
 ---
 
@@ -122,7 +124,6 @@ actual capabilities or be configurable.
 
 ## 7. Recommended Next Steps
 
-1. **`thread/tokenUsage/updated`** — Blocked on ACP `UsageUpdate` RFD (Draft)
-2. **`turn/steer`** — Mid-turn steering; no ACP equivalent yet
-3. **`item/tool/requestUserInput`** — Agent requests free-form user input
-4. **`item/tool/call`** — Dynamic client-side tool calls
+1. **`turn/steer`** — Mid-turn steering; no ACP equivalent yet
+2. **`item/tool/requestUserInput`** — Agent requests free-form user input
+3. **`item/tool/call`** — Dynamic client-side tool calls

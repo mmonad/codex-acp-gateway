@@ -333,6 +333,60 @@ pub fn translate_session_update(
                 diffs: vec![],
             }
         }
+        // ── Unstable variants ──────────────────────────────────────────
+        SessionUpdate::SessionInfoUpdate(info) => {
+            let mut notifications = Vec::new();
+
+            // If the agent updated the session title, emit thread/name/updated.
+            if let agent_client_protocol::MaybeUndefined::Value(ref title) = info.title {
+                notifications.push((
+                    "thread/name/updated".to_string(),
+                    json!({
+                        "threadId": thread_id,
+                        "threadName": title,
+                    }),
+                ));
+            }
+
+            TranslationResult {
+                notifications,
+                diffs: vec![],
+            }
+        }
+        SessionUpdate::UsageUpdate(usage) => {
+            // Map ACP UsageUpdate → Codex thread/tokenUsage/updated.
+            //
+            // ACP provides `used` (tokens in context) and `size` (window size).
+            // We approximate the Codex breakdown from the limited data available.
+            TranslationResult {
+                notifications: vec![(
+                    "thread/tokenUsage/updated".to_string(),
+                    json!({
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "tokenUsage": {
+                            "total": {
+                                "totalTokens": usage.used,
+                                "inputTokens": usage.used,
+                                "cachedInputTokens": 0,
+                                "outputTokens": 0,
+                                "reasoningOutputTokens": 0,
+                            },
+                            "last": {
+                                "totalTokens": usage.used,
+                                "inputTokens": usage.used,
+                                "cachedInputTokens": 0,
+                                "outputTokens": 0,
+                                "reasoningOutputTokens": 0,
+                            },
+                            "modelContextWindow": usage.size,
+                        },
+                    }),
+                )],
+                diffs: vec![],
+            }
+        }
+
         // Future-proof: any new variants added upstream are silently ignored.
         _ => TranslationResult {
             notifications: vec![],
@@ -362,6 +416,42 @@ pub fn translate_prompt_response(
                 "items": [],
                 "status": status,
                 "error": null,
+            },
+        }),
+    )
+}
+
+/// Translate an ACP `Usage` (from `PromptResponse`) into a Codex
+/// `thread/tokenUsage/updated` notification payload.
+///
+/// This provides more detailed token breakdown than the streaming `UsageUpdate`
+/// because `PromptResponse.usage` has per-category counts.
+pub fn translate_prompt_usage(
+    usage: &agent_client_protocol::Usage,
+    thread_id: &str,
+    turn_id: &str,
+) -> (String, Value) {
+    (
+        "thread/tokenUsage/updated".to_string(),
+        json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "tokenUsage": {
+                "total": {
+                    "totalTokens": usage.total_tokens,
+                    "inputTokens": usage.input_tokens,
+                    "cachedInputTokens": usage.cached_read_tokens.unwrap_or(0),
+                    "outputTokens": usage.output_tokens,
+                    "reasoningOutputTokens": usage.thought_tokens.unwrap_or(0),
+                },
+                "last": {
+                    "totalTokens": usage.total_tokens,
+                    "inputTokens": usage.input_tokens,
+                    "cachedInputTokens": usage.cached_read_tokens.unwrap_or(0),
+                    "outputTokens": usage.output_tokens,
+                    "reasoningOutputTokens": usage.thought_tokens.unwrap_or(0),
+                },
+                "modelContextWindow": null,
             },
         }),
     )
