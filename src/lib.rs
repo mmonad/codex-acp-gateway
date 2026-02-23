@@ -27,6 +27,7 @@ use crate::error::GatewayError;
 use crate::translation::acp_to_codex;
 use crate::translation::approval;
 use crate::translation::codex_to_acp;
+use crate::translation::ext_method;
 use crate::translation::id_map::{self, IdMap};
 use crate::translation::state::{GatewayState, SessionLifecycle};
 use crate::transport::TransportEvent;
@@ -1663,7 +1664,122 @@ async fn handle_acp_event(
                 }
             }
         }
+        AcpEvent::ExtMethodRequest {
+            request,
+            response_tx,
+        } => {
+            handle_ext_method_request(request, response_tx, outgoing, state).await;
+        }
     }
+}
+
+/// Handle an ACP `ext_method` request by routing to the appropriate Codex
+/// server request (`item/tool/call` or `item/tool/requestUserInput`).
+///
+/// Unknown extension methods receive a `method_not_found` error response.
+async fn handle_ext_method_request(
+    request: agent_client_protocol::ExtRequest,
+    response_tx: tokio::sync::oneshot::Sender<
+        agent_client_protocol::Result<agent_client_protocol::ExtResponse>,
+    >,
+    outgoing: &OutgoingMessageSender,
+    state: &GatewayState,
+) {
+    let method = request.method.as_ref();
+
+    // Find the active thread/turn from state (ext_method carries no session_id).
+    let (thread_id, turn_id) = find_active_turn(state);
+
+    // Parse the raw params to a serde_json::Value for inspection.
+    let params: Value = serde_json::from_str(request.params.get()).unwrap_or(json!({}));
+
+    match method {
+        ext_method::EXT_TOOL_CALL => {
+            let call_id = id_map::new_item_id();
+            let (codex_method, codex_params) =
+                ext_method::translate_ext_tool_call(&params, &thread_id, &turn_id, &call_id);
+
+            forward_ext_to_codex(
+                codex_method,
+                codex_params,
+                response_tx,
+                outgoing,
+                ext_method::translate_tool_call_response,
+            )
+            .await;
+        }
+        ext_method::EXT_REQUEST_USER_INPUT => {
+            let item_id = id_map::new_item_id();
+            let (codex_method, codex_params) = ext_method::translate_ext_request_user_input(
+                &params, &thread_id, &turn_id, &item_id,
+            );
+
+            forward_ext_to_codex(
+                codex_method,
+                codex_params,
+                response_tx,
+                outgoing,
+                ext_method::translate_user_input_response,
+            )
+            .await;
+        }
+        _ => {
+            warn!(method, "unknown ext method from agent");
+            let _ = response_tx.send(Err(agent_client_protocol::Error::method_not_found()
+                .data(format!("unknown ext method: {method}"))));
+        }
+    }
+}
+
+/// Send a Codex server request on behalf of an ext_method call, await the
+/// response, translate it back, and send it through the oneshot channel.
+async fn forward_ext_to_codex(
+    codex_method: String,
+    codex_params: Value,
+    response_tx: tokio::sync::oneshot::Sender<
+        agent_client_protocol::Result<agent_client_protocol::ExtResponse>,
+    >,
+    outgoing: &OutgoingMessageSender,
+    translate_response: fn(&Value) -> std::sync::Arc<serde_json::value::RawValue>,
+) {
+    match outgoing
+        .send_request(codex_method, Some(codex_params))
+        .await
+    {
+        Ok(rx) => {
+            tokio::task::spawn_local(async move {
+                match rx.await {
+                    Ok(resp) => {
+                        let raw = translate_response(&resp.result);
+                        let _ = response_tx.send(Ok(agent_client_protocol::ExtResponse::new(raw)));
+                    }
+                    Err(_) => {
+                        let _ = response_tx
+                            .send(Err(agent_client_protocol::Error::internal_error()
+                                .data("codex client disconnected during ext method")));
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            error!("failed to send ext method request to codex client: {e}");
+            let _ = response_tx.send(Err(agent_client_protocol::Error::internal_error()
+                .data("failed to forward ext method to codex client")));
+        }
+    }
+}
+
+/// Find the currently active thread and turn from gateway state.
+///
+/// If no turn is active (e.g. the ext_method arrives between turns), falls
+/// back to placeholder IDs.
+fn find_active_turn(state: &GatewayState) -> (String, String) {
+    for (tid, lifecycle) in &state.threads {
+        if let SessionLifecycle::InTurn { turn_id, .. } = lifecycle {
+            return (tid.clone(), turn_id.clone());
+        }
+    }
+    ("unknown-thread".to_string(), "unknown-turn".to_string())
 }
 
 /// Process an internal event from a background task (e.g. turn completion).

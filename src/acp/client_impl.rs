@@ -25,6 +25,14 @@ pub enum AcpEvent {
         /// Send the response back through this channel.
         response_tx: tokio::sync::oneshot::Sender<RequestPermissionResponse>,
     },
+    /// The agent is calling an extension method (e.g. `tool/call`,
+    /// `request_user_input`).  The gateway translates these into Codex
+    /// server requests and forwards to the Codex client.
+    ExtMethodRequest {
+        request: ExtRequest,
+        /// Send the response (or error) back through this channel.
+        response_tx: tokio::sync::oneshot::Sender<AcpResult<ExtResponse>>,
+    },
 }
 
 /// Our implementation of the ACP `Client` trait.
@@ -194,12 +202,20 @@ impl Client for GatewayAcpClient {
     }
 
     async fn ext_method(&self, args: ExtRequest) -> AcpResult<ExtResponse> {
-        tracing::debug!(method = %args.method, "unhandled ext method from agent");
-        Ok(ExtResponse::new(
-            serde_json::value::RawValue::from_string("null".into())
-                .unwrap()
-                .into(),
-        ))
+        tracing::info!(method = %args.method, "agent calling ext method");
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.event_tx
+            .send(AcpEvent::ExtMethodRequest {
+                request: args,
+                response_tx,
+            })
+            .map_err(|_| {
+                agent_client_protocol::Error::internal_error().data("gateway event loop shut down")
+            })?;
+        response_rx.await.map_err(|_| {
+            agent_client_protocol::Error::internal_error()
+                .data("ext method response channel dropped")
+        })?
     }
 
     async fn ext_notification(&self, args: ExtNotification) -> AcpResult<()> {

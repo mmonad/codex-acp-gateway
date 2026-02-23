@@ -8,7 +8,7 @@
 | Area | Implemented | Gap | Notes |
 |------|-------------|-----|-------|
 | Codex client requests (v2) | 28 of 36 | 8 | Account, remote skills, steer/review |
-| Codex server requests | 2 of 5 | 3 | Tool input, dynamic tool call, token refresh |
+| Codex server requests | 4 of 5 | 1 | Only token refresh remaining |
 | Codex server notifications | 20 of ~35 | ~15 | Account, config, terminal notifications |
 | ACP Agent trait (stable) | 8 of 8 | 0 | Full coverage |
 | ACP Agent trait (unstable) | 4 of 4 | 0 | Full coverage (feature-gated) |
@@ -46,12 +46,21 @@
 
 ---
 
-## 2. Codex Server Requests — Not Implemented
+## 2. Codex Server Requests
+
+### Implemented
+
+| Wire method | ACP trigger | Notes |
+|---|---|---|
+| `item/commandExecution/requestApproval` | `request_permission` (ToolKind::Execute) | Stable approval flow |
+| `item/fileChange/requestApproval` | `request_permission` (ToolKind::Edit/Delete/Move) | Stable approval flow |
+| `item/tool/call` | `ext_method("tool/call", ...)` | Dynamic tool call — forwarded to Codex client |
+| `item/tool/requestUserInput` | `ext_method("request_user_input", ...)` | Free-form user input — forwarded to Codex client |
+
+### Not Implemented
 
 | Wire method | Priority | Notes |
 |---|---|---|
-| `item/tool/requestUserInput` | Medium | Agent requests free-form user input (not just approve/reject) |
-| `item/tool/call` | Medium | Dynamic tool call — gateway invokes a client-side tool |
 | `account/chatgptAuthTokens/refresh` | Low | OpenAI-specific auth token refresh |
 
 ---
@@ -104,7 +113,21 @@ The gateway checks agent capabilities at runtime and falls back gracefully.
 
 ---
 
-## 6. Translation Quality Issues
+## 6. ACP Extension Methods — Implemented
+
+The gateway uses ACP's `ext_method` escape hatch to bridge features that have
+no dedicated ACP protocol method but are needed by the Codex client.
+
+| ACP `ext_method` name | Codex server request | Response mapping |
+|---|---|---|
+| `tool/call` | `item/tool/call` | `{ contentItems, success }` passed through |
+| `request_user_input` | `item/tool/requestUserInput` | `{ answers: { qid: { answers } } }` passed through |
+
+Unknown extension methods receive a `method_not_found` error response.
+
+---
+
+## 7. Translation Quality Issues
 
 ### Permission ToolKind bucketing is coarse
 
@@ -122,8 +145,6 @@ actual capabilities or be configurable.
 
 ---
 
-## 7. Recommended Next Steps
+## 8. Recommended Next Steps
 
 1. **`turn/steer`** — Mid-turn steering; no ACP equivalent yet
-2. **`item/tool/requestUserInput`** — Agent requests free-form user input
-3. **`item/tool/call`** — Dynamic client-side tool calls
