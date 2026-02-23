@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use agent_client_protocol::{
-    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
-    TextContent,
+    ClientCapabilities, ContentBlock, FileSystemCapability, InitializeRequest,
+    LoadSessionRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, TextContent,
 };
 use serde_json::Value;
 
@@ -11,7 +12,8 @@ use super::content::codex_input_to_acp;
 /// Translate a Codex `initialize` request (as JSON params) into an ACP `InitializeRequest`.
 ///
 /// The Codex initialize carries `clientInfo { name, version }` and capabilities.
-/// We map these to the ACP equivalent.
+/// We map these to the ACP equivalent, advertising that the gateway supports
+/// filesystem and terminal callbacks.
 pub fn translate_initialize(params: &Value) -> InitializeRequest {
     let mut req = InitializeRequest::new(ProtocolVersion::LATEST);
 
@@ -26,6 +28,17 @@ pub fn translate_initialize(params: &Value) -> InitializeRequest {
             .unwrap_or("0.0.0");
         req = req.client_info(agent_client_protocol::Implementation::new(name, version));
     }
+
+    // Advertise the callbacks the gateway handles locally.
+    req = req.client_capabilities(
+        ClientCapabilities::new()
+            .fs(
+                FileSystemCapability::new()
+                    .read_text_file(true)
+                    .write_text_file(true),
+            )
+            .terminal(true),
+    );
 
     req
 }
@@ -58,4 +71,40 @@ pub fn translate_turn_start(params: &Value, session_id: &str) -> PromptRequest {
     };
 
     PromptRequest::new(session_id.to_string(), prompt)
+}
+
+/// Translate a Codex `thread/resume` request into an ACP `LoadSessionRequest`.
+pub fn translate_thread_resume(
+    params: &Value,
+    session_id: &str,
+    fallback_cwd: &Path,
+) -> LoadSessionRequest {
+    let cwd = params
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fallback_cwd.to_path_buf());
+
+    LoadSessionRequest::new(session_id.to_string(), cwd)
+}
+
+/// Translate into an ACP `SetSessionModeRequest`.
+pub fn translate_set_session_mode(
+    session_id: &str,
+    mode_id: &str,
+) -> SetSessionModeRequest {
+    SetSessionModeRequest::new(session_id.to_string(), mode_id.to_string())
+}
+
+/// Translate into an ACP `SetSessionConfigOptionRequest`.
+pub fn translate_set_session_config_option(
+    session_id: &str,
+    config_id: &str,
+    value: &str,
+) -> SetSessionConfigOptionRequest {
+    SetSessionConfigOptionRequest::new(
+        session_id.to_string(),
+        config_id.to_string(),
+        value.to_string(),
+    )
 }

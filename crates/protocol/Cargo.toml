@@ -34,3 +34,8 @@ ts-rs = { workspace = true, features = [
     "no-serde-warnings",
 ] }
 uuid = { workspace = true, features = ["serde", "v7", "v4"] }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }

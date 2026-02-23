@@ -1,4 +1,6 @@
-use agent_client_protocol::{ContentBlock, SessionUpdate, ToolCallStatus, ToolKind};
+use agent_client_protocol::{
+    ContentBlock, EmbeddedResourceResource, SessionUpdate, ToolCallStatus, ToolKind,
+};
 use serde_json::{Value, json};
 
 use super::id_map::IdMap;
@@ -43,6 +45,7 @@ pub fn translate_session_update(
         SessionUpdate::ToolCall(tool_call) => {
             let tool_call_id = tool_call.tool_call_id.0.as_ref();
             let item_id = id_map.create_item_for_tool(tool_call_id);
+            id_map.set_tool_kind(tool_call_id, tool_call.kind);
 
             // Determine the Codex item type based on ACP ToolKind
             let item = match tool_call.kind {
@@ -123,25 +126,47 @@ pub fn translate_session_update(
             }
 
             // If the tool call is completed or failed, emit item/completed
-            if let Some(status) = &update.fields.status {
-                if matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
+            if let Some(status) = &update.fields.status
+                && matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed)
+            {
                     let codex_status = match status {
                         ToolCallStatus::Completed => "completed",
                         ToolCallStatus::Failed => "failed",
                         _ => "inProgress",
                     };
-                    // Build a minimal completed item
-                    let item = json!({
-                        "type": "mcpToolCall",
-                        "id": item_id,
-                        "server": "acp",
-                        "tool": update.fields.title.as_deref().unwrap_or("unknown"),
-                        "status": codex_status,
-                        "arguments": {},
-                        "result": null,
-                        "error": null,
-                        "durationMs": null,
-                    });
+
+                    let title = update.fields.title.as_deref().unwrap_or("unknown");
+                    let kind = id_map.lookup_tool_kind(tool_call_id);
+
+                    let item = match kind {
+                        Some(ToolKind::Execute) => json!({
+                            "type": "commandExecution",
+                            "id": item_id,
+                            "command": title,
+                            "cwd": ".",
+                            "status": codex_status,
+                            "exitCode": null,
+                            "durationMs": null,
+                        }),
+                        Some(ToolKind::Edit | ToolKind::Delete | ToolKind::Move) => json!({
+                            "type": "fileChange",
+                            "id": item_id,
+                            "changes": [],
+                            "status": codex_status,
+                        }),
+                        _ => json!({
+                            "type": "mcpToolCall",
+                            "id": item_id,
+                            "server": "acp",
+                            "tool": title,
+                            "status": codex_status,
+                            "arguments": {},
+                            "result": null,
+                            "error": null,
+                            "durationMs": null,
+                        }),
+                    };
+
                     notifications.push((
                         "item/completed".to_string(),
                         json!({
@@ -150,7 +175,6 @@ pub fn translate_session_update(
                             "item": item,
                         }),
                     ));
-                }
             }
 
             notifications
@@ -182,7 +206,58 @@ pub fn translate_session_update(
                 }),
             )]
         }
-        // Other update types we don't translate yet
+        SessionUpdate::UserMessageChunk(_) => {
+            // Echo of user input — the Codex client already has it, so ignore.
+            vec![]
+        }
+        SessionUpdate::AvailableCommandsUpdate(update) => {
+            let commands: Vec<Value> = update
+                .available_commands
+                .iter()
+                .map(|cmd| {
+                    json!({
+                        "name": cmd.name,
+                        "description": cmd.description,
+                    })
+                })
+                .collect();
+            vec![(
+                "gateway/availableCommands/updated".to_string(),
+                json!({
+                    "threadId": thread_id,
+                    "commands": commands,
+                }),
+            )]
+        }
+        SessionUpdate::CurrentModeUpdate(update) => {
+            vec![(
+                "thread/status/changed".to_string(),
+                json!({
+                    "threadId": thread_id,
+                    "mode": update.current_mode_id.0.as_ref(),
+                }),
+            )]
+        }
+        SessionUpdate::ConfigOptionUpdate(update) => {
+            let options: Vec<Value> = update
+                .config_options
+                .iter()
+                .map(|opt| {
+                    json!({
+                        "id": opt.id.0.as_ref(),
+                        "name": opt.name,
+                    })
+                })
+                .collect();
+            vec![(
+                "gateway/configOptions/updated".to_string(),
+                json!({
+                    "threadId": thread_id,
+                    "configOptions": options,
+                }),
+            )]
+        }
+        // Future-proof: any new variants added upstream are silently ignored.
         _ => vec![],
     }
 }
@@ -213,10 +288,31 @@ pub fn translate_prompt_response(
     )
 }
 
-/// Extract text from a ContentBlock, returning an empty string for non-text content.
+/// Extract a text representation from a ContentBlock.
+///
+/// Returns the text directly for text content, or a descriptive placeholder for
+/// non-text content (images, audio, resources).
 fn extract_text_from_content(content: &ContentBlock) -> String {
     match content {
         ContentBlock::Text(t) => t.text.clone(),
+        ContentBlock::Image(img) => {
+            if let Some(uri) = &img.uri {
+                format!("[image: {uri}]")
+            } else {
+                format!("[image: {}]", img.mime_type)
+            }
+        }
+        ContentBlock::Audio(_) => "[audio content]".to_string(),
+        ContentBlock::Resource(res) => match &res.resource {
+            EmbeddedResourceResource::TextResourceContents(t) => t.text.clone(),
+            EmbeddedResourceResource::BlobResourceContents(b) => {
+                format!("[blob resource: {}]", b.uri)
+            }
+            _ => "[resource]".to_string(),
+        },
+        ContentBlock::ResourceLink(link) => {
+            format!("[resource: {} ({})]", link.name, link.uri)
+        }
         _ => String::new(),
     }
 }

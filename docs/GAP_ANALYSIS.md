@@ -1,0 +1,157 @@
+# Protocol Gap Analysis
+
+> Audit of codex-acp-gateway coverage against both the Codex app-server
+> protocol and the Agent Client Protocol (ACP). Last updated: 2026-02-23.
+
+## Summary
+
+| Area | Implemented | Gap | Notes |
+|------|-------------|-----|-------|
+| Codex client requests (v2) | 8 of 36 | 28 | Management APIs, thread lifecycle, skills, config |
+| Codex server requests | 2 of 5 | 3 | Tool input, dynamic tool call, token refresh |
+| Codex server notifications | 13 of ~35 | ~22 | Account, config, diff, usage notifications |
+| ACP Agent trait (stable) | 8 of 8 | 0 | Full coverage |
+| ACP Agent trait (unstable) | 0 of 4 | 4 | Feature-gated session methods |
+| ACP Client trait | 11 of 11 | 0 | Full coverage |
+| ACP SessionUpdate (stable) | 9 of 9 | 0 | Full coverage |
+| ACP SessionUpdate (unstable) | 0 of 2 | 2 | SessionInfoUpdate, UsageUpdate |
+
+---
+
+## 1. Codex Client Requests — Not Implemented
+
+### v2 (current API)
+
+| Wire method | Priority | Notes |
+|---|---|---|
+| `thread/fork` | Medium | Maps to ACP `session/fork` (unstable) |
+| `thread/archive` | Low | No ACP equivalent |
+| `thread/unarchive` | Low | No ACP equivalent |
+| `thread/list` | Low | Needs gateway-side persistent storage |
+| `thread/loaded/list` | Low | In-memory state query |
+| `thread/read` | Low | Needs gateway-side storage |
+| `thread/compact/start` | Low | No direct ACP equivalent |
+| `thread/rollback` | Low | No direct ACP equivalent |
+| `thread/name/set` | Low | Cosmetic, no ACP equivalent |
+| `turn/steer` | Medium | No ACP equivalent currently |
+| `review/start` | Low | Codex-specific feature |
+| `model/list` | Medium | Could query ACP agent info |
+| `skills/list` | Low | No ACP equivalent |
+| `skills/remote/list` | Low | No ACP equivalent |
+| `skills/remote/export` | Low | No ACP equivalent |
+| `skills/config/write` | Low | No ACP equivalent |
+| `app/list` | Low | No ACP equivalent |
+| `config/read` | Low | Gateway/agent config |
+| `config/value/write` | Low | Config write |
+| `config/batchWrite` | Low | Batch config write |
+| `configRequirements/read` | Low | Codex-specific |
+| `account/read` | Low | Codex auth, not applicable |
+| `account/login/start` | Low | Codex-specific |
+| `account/login/cancel` | Low | Codex-specific |
+| `account/logout` | Low | Codex-specific |
+| `account/rateLimits/read` | Low | Codex-specific |
+| `feedback/upload` | Low | Codex-specific |
+| `mcpServer/oauth/login` | Low | Codex-specific |
+| `config/mcpServer/reload` | Low | Codex-specific |
+| `mcpServerStatus/list` | Low | Codex-specific |
+| `experimentalFeature/list` | Low | Could return empty list |
+| `windowsSandbox/setupStart` | Low | Windows-only |
+| `fuzzyFileSearch` | Low | Could implement locally |
+
+### Experimental
+
+| Wire method | Notes |
+|---|---|
+| `thread/backgroundTerminals/clean` | Experimental terminal cleanup |
+| `collaborationMode/list` | Experimental collaboration modes |
+| `fuzzyFileSearch/session*` | Experimental incremental file search |
+
+---
+
+## 2. Codex Server Requests — Not Implemented
+
+| Wire method | Priority | Notes |
+|---|---|---|
+| `item/tool/requestUserInput` | Medium | Agent requests free-form user input (not just approve/reject) |
+| `item/tool/call` | Medium | Dynamic tool call — gateway invokes a client-side tool |
+| `account/chatgptAuthTokens/refresh` | Low | OpenAI-specific auth token refresh |
+
+---
+
+## 3. Codex Server Notifications — Not Implemented
+
+| Wire method | Priority | Notes |
+|---|---|---|
+| `thread/archived` | Low | Archive confirmation |
+| `thread/unarchived` | Low | Unarchive confirmation |
+| `thread/name/updated` | Low | Name change confirmation |
+| `thread/tokenUsage/updated` | Medium | Token usage tracking — useful for UIs |
+| `thread/compacted` | Low | Context compaction notification |
+| `turn/diff/updated` | Medium | Diff of file changes during a turn |
+| `item/plan/delta` | Low | Incremental plan text delta (we use `turn/plan/updated` instead) |
+| `item/fileChange/outputDelta` | Medium | File change content streaming |
+| `item/commandExecution/terminalInteraction` | Low | Terminal interaction events |
+| `item/mcpToolCall/progress` | Low | MCP tool call progress |
+| `item/reasoning/summaryPartAdded` | Low | Reasoning summary part boundaries |
+| `item/reasoning/textDelta` | Low | Raw reasoning text (vs summary) |
+| `rawResponseItem/completed` | Low | Raw model response items |
+| `model/rerouted` | Low | Model reroute notification |
+| `account/updated` | Low | Account state changes |
+| `account/rateLimits/updated` | Low | Rate limit changes |
+| `account/login/completed` | Low | Login completion |
+| `app/list/updated` | Low | App list changes |
+| `mcpServer/oauthLogin/completed` | Low | MCP OAuth completion |
+| `deprecationNotice` | Low | Deprecation warnings |
+| `configWarning` | Low | Config warnings |
+| `fuzzyFileSearch/session*` | Low | File search results |
+| `windowsSandbox/setupCompleted` | Low | Windows sandbox |
+| `windows/worldWritableWarning` | Low | Windows security |
+
+---
+
+## 4. ACP Unstable Methods — Not Implemented
+
+| ACP method | Feature flag | Notes |
+|---|---|---|
+| `session/set_model` | `unstable_session_model` | Change model mid-session |
+| `session/list` | `unstable_session_list` | List agent's sessions |
+| `session/fork` | `unstable_session_fork` | Fork session (maps to `thread/fork`) |
+| `session/resume` | `unstable_session_resume` | Resume without replay |
+
+---
+
+## 5. ACP Unstable SessionUpdate Variants — Not Implemented
+
+| SessionUpdate variant | Feature flag | Notes |
+|---|---|---|
+| `SessionInfoUpdate` | `unstable_session_info_update` | Session title/timestamp updates |
+| `UsageUpdate` | `unstable_session_usage` | Token usage / cost updates |
+
+---
+
+## 6. Translation Quality Issues
+
+### Permission ToolKind bucketing is coarse
+
+The approval translation maps everything that isn't Edit/Delete/Move to
+`item/commandExecution/requestApproval`. ToolKind variants like `Read`,
+`Browser`, `Notebook`, `Other` all get the same command-execution treatment.
+Codex only has two approval types today, so this may not be fixable without
+upstream changes.
+
+### Hardcoded response fields
+
+`handle_thread_start` hardcodes `approvalPolicy: "on-request"` and
+`sandbox: { type: "dangerFullAccess" }`. These should reflect the agent's
+actual capabilities or be configurable.
+
+---
+
+## 7. Recommended Next Steps
+
+1. **`model/list`** — Enables model selection; needs ACP unstable `session/set_model`
+2. **`thread/list` / `thread/read`** — Thread management; needs gateway-side storage
+3. **`turn/diff/updated`** — File diff notification; important for IDE integrations
+4. **`thread/tokenUsage/updated`** — Token tracking; could map to ACP unstable `UsageUpdate`
+5. **`experimentalFeature/list`** — Return empty list to avoid client errors
+6. **`turn/steer`** — Mid-turn steering; no ACP equivalent yet

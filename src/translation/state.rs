@@ -1,5 +1,9 @@
 use std::collections::HashMap;
 
+use agent_client_protocol::{
+    AgentCapabilities, AuthMethod, SessionConfigOption, SessionModeState,
+};
+
 /// Tracks the lifecycle state of a single Codex thread / ACP session pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionLifecycle {
@@ -7,6 +11,8 @@ pub enum SessionLifecycle {
     Uninitialized,
     /// A `session/new` request is in-flight.
     Creating,
+    /// A `session/load` request is in-flight.
+    Loading,
     /// The ACP session exists but no turn is active.
     Idle { session_id: String },
     /// A prompt turn is in progress.
@@ -28,6 +34,14 @@ pub struct GatewayState {
     pub client_version: Option<String>,
     /// Per-thread lifecycle state keyed by Codex thread ID.
     pub threads: HashMap<String, SessionLifecycle>,
+    /// Agent capabilities from the ACP initialize response.
+    pub agent_capabilities: Option<AgentCapabilities>,
+    /// Auth methods advertised by the ACP agent.
+    pub auth_methods: Vec<AuthMethod>,
+    /// Per-session mode state (keyed by ACP session ID).
+    pub session_modes: HashMap<String, SessionModeState>,
+    /// Per-session config options (keyed by ACP session ID).
+    pub session_config: HashMap<String, Vec<SessionConfigOption>>,
 }
 
 impl GatewayState {
@@ -37,6 +51,10 @@ impl GatewayState {
             client_name: None,
             client_version: None,
             threads: HashMap::new(),
+            agent_capabilities: None,
+            auth_methods: Vec::new(),
+            session_modes: HashMap::new(),
+            session_config: HashMap::new(),
         }
     }
 

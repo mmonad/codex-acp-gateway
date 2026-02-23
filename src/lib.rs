@@ -224,12 +224,22 @@ async fn handle_codex_request(
             return;
         }
         "thread/start" => handle_thread_start(&params, agent.as_ref(), state, id_map, cwd).await,
+        "thread/resume" => {
+            handle_thread_resume(&params, agent.as_ref(), state, id_map, cwd).await
+        }
         "turn/start" => {
             handle_turn_start(&params, Rc::clone(agent), outgoing, state, id_map).await
         }
         "turn/interrupt" => {
             handle_turn_interrupt(&params, agent.as_ref(), state, id_map).await
         }
+        "session/setMode" => {
+            handle_set_session_mode(&params, agent.as_ref(), state, id_map).await
+        }
+        "session/setConfigOption" => {
+            handle_set_session_config_option(&params, agent.as_ref(), state, id_map).await
+        }
+        "command/exec" => handle_command_exec(&params, cwd).await,
         method => {
             debug!(method, "unhandled codex request method");
             Err(GatewayError::Translation(format!(
@@ -238,10 +248,24 @@ async fn handle_codex_request(
         }
     };
 
+    // After successful thread/start or thread/resume, emit a thread/started notification.
+    let emit_thread_started = matches!(req.method.as_str(), "thread/start" | "thread/resume")
+        && result.is_ok();
+
     match result {
         Ok(value) => {
             if let Err(e) = outgoing.send_response(id, value).await {
                 error!("failed to send response: {e}");
+            }
+            if emit_thread_started
+                && let Some(thread_id) = params.get("threadId").and_then(|v| v.as_str())
+            {
+                let _ = outgoing
+                    .send_notification(
+                        "thread/started",
+                        Some(json!({ "threadId": thread_id })),
+                    )
+                    .await;
             }
         }
         Err(e) => {
@@ -253,7 +277,8 @@ async fn handle_codex_request(
     }
 }
 
-/// Handle `initialize` - translate to ACP initialize and return response.
+/// Handle `initialize` - translate to ACP initialize, auto-authenticate if
+/// needed, and return a rich response.
 async fn handle_initialize(
     params: &Value,
     agent: &(impl Agent + ?Sized),
@@ -266,6 +291,21 @@ async fn handle_initialize(
         .await
         .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
 
+    // Store agent capabilities and auth methods.
+    state.agent_capabilities = Some(acp_resp.agent_capabilities.clone());
+    state.auth_methods = acp_resp.auth_methods.clone();
+
+    // Auto-authenticate if the agent advertises auth methods.
+    if let Some(first_method) = acp_resp.auth_methods.first() {
+        info!(method_id = %first_method.id.0, "auto-authenticating with agent");
+        let auth_req =
+            agent_client_protocol::AuthenticateRequest::new(first_method.id.clone());
+        agent
+            .authenticate(auth_req)
+            .await
+            .map_err(|e| GatewayError::Acp(format!("authenticate failed: {e:?}")))?;
+    }
+
     state.initialized = true;
     if let Some(info) = params.get("clientInfo") {
         state.client_name = info.get("name").and_then(|v| v.as_str()).map(String::from);
@@ -275,17 +315,21 @@ async fn handle_initialize(
             .map(String::from);
     }
 
-    let version = format!("{}", acp_resp.protocol_version);
-    info!(protocol_version = %version, "ACP initialize complete");
+    let protocol_version = format!("{}", acp_resp.protocol_version);
+    info!(protocol_version = %protocol_version, "ACP initialize complete");
+
+    let agent_version = acp_resp
+        .agent_info
+        .as_ref()
+        .map(|i| i.version.as_str())
+        .unwrap_or("unknown");
 
     Ok(json!({
-        "userAgent": format!(
-            "codex-acp-gateway/0.1.0 (acp-agent/{})",
-            acp_resp.agent_info
-                .as_ref()
-                .map(|i| i.version.as_str())
-                .unwrap_or("unknown")
-        ),
+        "userAgent": format!("codex-acp-gateway/0.1.0 (acp-agent/{agent_version})"),
+        "protocolVersion": protocol_version,
+        "capabilities": {
+            "experimental": {},
+        },
     }))
 }
 
@@ -512,6 +556,235 @@ async fn handle_turn_interrupt(
     );
 
     Ok(json!({}))
+}
+
+/// Handle `thread/resume` — load an existing ACP session.
+async fn handle_thread_resume(
+    params: &Value,
+    agent: &(impl Agent + ?Sized),
+    state: &mut GatewayState,
+    id_map: &mut IdMap,
+    cwd: &std::path::Path,
+) -> Result<Value, GatewayError> {
+    if !state.initialized {
+        return Err(GatewayError::NotInitialized);
+    }
+
+    // The Codex client sends threadId for the thread to resume.
+    let thread_id = params
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("missing threadId".into()))?;
+
+    // Look up the existing session for this thread, or use threadId as session_id
+    // if this is a session the agent knows about from a previous run.
+    let session_id = id_map
+        .lookup_session(thread_id)
+        .cloned()
+        .unwrap_or_else(|| thread_id.to_string());
+
+    state.set_lifecycle(thread_id.to_string(), SessionLifecycle::Loading);
+
+    let acp_req = codex_to_acp::translate_thread_resume(params, &session_id, cwd);
+    let acp_resp = agent
+        .load_session(acp_req)
+        .await
+        .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
+
+    // Store modes and config from the response.
+    if let Some(modes) = acp_resp.modes {
+        state.session_modes.insert(session_id.clone(), modes);
+    }
+    if let Some(config) = acp_resp.config_options {
+        state.session_config.insert(session_id.clone(), config);
+    }
+
+    // Ensure the mapping exists.
+    if id_map.lookup_session(thread_id).is_none() {
+        id_map.create_thread_session_mapping(thread_id.to_string(), session_id.clone());
+    }
+
+    state.set_lifecycle(
+        thread_id.to_string(),
+        SessionLifecycle::Idle {
+            session_id: session_id.clone(),
+        },
+    );
+
+    info!(%thread_id, %session_id, "thread/session resumed");
+
+    Ok(json!({
+        "thread": {
+            "id": thread_id,
+            "cwd": cwd.to_string_lossy(),
+            "cliVersion": "0.1.0",
+            "createdAt": chrono_now_secs(),
+            "updatedAt": chrono_now_secs(),
+            "modelProvider": "acp",
+            "preview": "",
+            "source": "appServer",
+            "status": { "type": "idle" },
+            "turns": [],
+        },
+        "model": "acp-agent",
+        "modelProvider": "acp",
+        "cwd": cwd.to_string_lossy(),
+        "approvalPolicy": "on-request",
+        "sandbox": { "type": "dangerFullAccess" },
+    }))
+}
+
+/// Handle `session/setMode` — change the agent's session mode.
+async fn handle_set_session_mode(
+    params: &Value,
+    agent: &(impl Agent + ?Sized),
+    _state: &mut GatewayState,
+    id_map: &mut IdMap,
+) -> Result<Value, GatewayError> {
+    let thread_id = params
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("missing threadId".into()))?;
+    let mode_id = params
+        .get("modeId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("missing modeId".into()))?;
+
+    let session_id = id_map
+        .lookup_session(thread_id)
+        .ok_or_else(|| GatewayError::SessionNotFound {
+            thread_id: thread_id.into(),
+        })?
+        .clone();
+
+    let acp_req = codex_to_acp::translate_set_session_mode(&session_id, mode_id);
+    agent
+        .set_session_mode(acp_req)
+        .await
+        .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
+
+    info!(%thread_id, %mode_id, "session mode changed");
+
+    // The agent will send a CurrentModeUpdate notification confirming the change.
+    Ok(json!({}))
+}
+
+/// Handle `session/setConfigOption` — change an agent config option.
+async fn handle_set_session_config_option(
+    params: &Value,
+    agent: &(impl Agent + ?Sized),
+    state: &mut GatewayState,
+    id_map: &mut IdMap,
+) -> Result<Value, GatewayError> {
+    let thread_id = params
+        .get("threadId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("missing threadId".into()))?;
+    let config_id = params
+        .get("configId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("missing configId".into()))?;
+    let value = params
+        .get("value")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| GatewayError::Translation("missing value".into()))?;
+
+    let session_id = id_map
+        .lookup_session(thread_id)
+        .ok_or_else(|| GatewayError::SessionNotFound {
+            thread_id: thread_id.into(),
+        })?
+        .clone();
+
+    let acp_req =
+        codex_to_acp::translate_set_session_config_option(&session_id, config_id, value);
+    let acp_resp = agent
+        .set_session_config_option(acp_req)
+        .await
+        .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
+
+    // Store updated config in state.
+    state
+        .session_config
+        .insert(session_id.clone(), acp_resp.config_options.clone());
+
+    info!(%thread_id, %config_id, %value, "session config option changed");
+
+    // Return the full updated config options so the client can refresh its UI.
+    let options: Vec<Value> = acp_resp
+        .config_options
+        .iter()
+        .map(|opt| {
+            json!({
+                "id": opt.id.0.as_ref(),
+                "name": opt.name,
+            })
+        })
+        .collect();
+
+    Ok(json!({ "configOptions": options }))
+}
+
+/// Handle `command/exec` — execute a command locally and return its output.
+///
+/// This is a Codex client request for one-off command execution (e.g. running
+/// a build tool). The gateway handles it directly without involving the ACP
+/// agent.
+async fn handle_command_exec(
+    params: &Value,
+    cwd: &std::path::Path,
+) -> Result<Value, GatewayError> {
+    let command: Vec<String> = params
+        .get("command")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .ok_or_else(|| GatewayError::Translation("command/exec: missing 'command' array".into()))?;
+
+    if command.is_empty() {
+        return Err(GatewayError::Translation(
+            "command/exec: empty command array".into(),
+        ));
+    }
+
+    let timeout_ms = params
+        .get("timeoutMs")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(30_000);
+
+    let exec_cwd = params
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| cwd.to_path_buf());
+
+    debug!(cmd = ?command, cwd = %exec_cwd.display(), "command/exec");
+
+    let child = tokio::process::Command::new(&command[0])
+        .args(&command[1..])
+        .current_dir(&exec_cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| GatewayError::Translation(format!("command/exec spawn failed: {e}")))?;
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms as u64),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| {
+        GatewayError::Translation(format!("command/exec timed out after {timeout_ms}ms"))
+    })?
+    .map_err(|e| GatewayError::Translation(format!("command/exec failed: {e}")))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit_code = output.status.code().unwrap_or(-1);
+    Ok(json!({
+        "exitCode": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+    }))
 }
 
 /// Handle an ACP event (notification or permission request from the agent).

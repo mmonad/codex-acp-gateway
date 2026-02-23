@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+
+use agent_client_protocol::ToolKind;
 use uuid::Uuid;
 
 /// Bidirectional ID mapping between Codex and ACP identifiers.
@@ -15,6 +17,8 @@ pub struct IdMap {
     tool_to_item: HashMap<String, String>,
     /// Codex itemId -> ACP toolCallId
     item_to_tool: HashMap<String, String>,
+    /// ACP toolCallId -> ToolKind (for correct item/completed type)
+    tool_kind: HashMap<String, ToolKind>,
 }
 
 impl IdMap {
@@ -58,6 +62,16 @@ impl IdMap {
     /// Look up the ACP tool call ID for a Codex item ID.
     pub fn lookup_tool(&self, item_id: &str) -> Option<&String> {
         self.item_to_tool.get(item_id)
+    }
+
+    /// Store the ACP ToolKind for a tool call ID.
+    pub fn set_tool_kind(&mut self, tool_call_id: &str, kind: ToolKind) {
+        self.tool_kind.insert(tool_call_id.to_string(), kind);
+    }
+
+    /// Look up the ToolKind for an ACP tool call ID.
+    pub fn lookup_tool_kind(&self, tool_call_id: &str) -> Option<&ToolKind> {
+        self.tool_kind.get(tool_call_id)
     }
 }
 
