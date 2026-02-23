@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use agent_client_protocol::{
-    AgentCapabilities, AuthMethod, SessionConfigOption, SessionModelState, SessionModeState,
+    AgentCapabilities, AuthMethod, SessionConfigOption, SessionModeState, SessionModelState,
 };
 
 use crate::rollout::recorder::RolloutRecorder;

@@ -2,9 +2,8 @@ use std::path::Path;
 
 use agent_client_protocol::{
     ClientCapabilities, ContentBlock, FileSystemCapability, ForkSessionRequest, InitializeRequest,
-    LoadSessionRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
-    ResumeSessionRequest, SetSessionConfigOptionRequest, SetSessionModelRequest,
-    SetSessionModeRequest, TextContent,
+    LoadSessionRequest, NewSessionRequest, PromptRequest, ProtocolVersion, ResumeSessionRequest,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, TextContent,
 };
 use serde_json::Value;
 

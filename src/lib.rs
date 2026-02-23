@@ -9,8 +9,8 @@ use std::rc::Rc;
 
 use agent_client_protocol::{Agent, ClientSideConnection};
 use anyhow::{Context, Result};
-use codex_app_server_protocol::{JSONRPCMessage, JSONRPCRequest, JSONRPCResponse};
 use codex_app_server_protocol::build_turns_from_rollout_items;
+use codex_app_server_protocol::{JSONRPCMessage, JSONRPCRequest, JSONRPCResponse};
 use codex_protocol::protocol::{
     EventMsg, RolloutItem, SessionMeta, SessionMetaLine, SessionSource, ThreadRolledBackEvent,
 };
@@ -252,7 +252,17 @@ async fn handle_codex_request(
         }
         "thread/start" => handle_thread_start(&params, agent.as_ref(), state, id_map, cwd).await,
         "thread/resume" => handle_thread_resume(&params, agent.as_ref(), state, id_map, cwd).await,
-        "turn/start" => handle_turn_start(&params, Rc::clone(agent), outgoing, state, id_map, internal_tx).await,
+        "turn/start" => {
+            handle_turn_start(
+                &params,
+                Rc::clone(agent),
+                outgoing,
+                state,
+                id_map,
+                internal_tx,
+            )
+            .await
+        }
         "turn/interrupt" => handle_turn_interrupt(&params, agent.as_ref(), state, id_map).await,
         "session/setMode" => handle_set_session_mode(&params, agent.as_ref(), state, id_map).await,
         "session/setConfigOption" => {
@@ -278,7 +288,9 @@ async fn handle_codex_request(
         "thread/list" => handle_thread_list(&params, agent.as_ref(), state).await,
         "thread/read" => handle_thread_read(&params, state).await,
         "thread/fork" => handle_thread_fork(&params, agent.as_ref(), state, id_map, cwd).await,
-        "thread/rollback" => handle_thread_rollback(&params, agent.as_ref(), state, id_map, cwd).await,
+        "thread/rollback" => {
+            handle_thread_rollback(&params, agent.as_ref(), state, id_map, cwd).await
+        }
         "model/list" => handle_model_list(state),
 
         // Stub handlers — return empty/default responses
@@ -305,8 +317,10 @@ async fn handle_codex_request(
 
     // After successful thread/start or thread/resume, emit a thread/started notification.
     // Extract the thread from the response value (works for both start and resume).
-    let emit_thread_started =
-        matches!(req.method.as_str(), "thread/start" | "thread/resume" | "thread/fork") && result.is_ok();
+    let emit_thread_started = matches!(
+        req.method.as_str(),
+        "thread/start" | "thread/resume" | "thread/fork"
+    ) && result.is_ok();
 
     match result {
         Ok(value) => {
@@ -447,8 +461,7 @@ async fn handle_thread_start(
         .unwrap_or_else(|_| "unknown".to_string());
     let session_meta = SessionMetaLine {
         meta: SessionMeta {
-            id: codex_protocol::ThreadId::from_string(&thread_id)
-                .unwrap_or_default(),
+            id: codex_protocol::ThreadId::from_string(&thread_id).unwrap_or_default(),
             forked_from_id: None,
             timestamp: now_str.clone(),
             cwd: cwd.to_path_buf(),
@@ -735,8 +748,7 @@ async fn handle_thread_resume(
         .is_some();
 
     let (modes, config) = if supports_resume {
-        let acp_req =
-            codex_to_acp::translate_thread_resume_session(params, &session_id, cwd);
+        let acp_req = codex_to_acp::translate_thread_resume_session(params, &session_id, cwd);
         let acp_resp = agent
             .resume_session(acp_req)
             .await
@@ -777,7 +789,9 @@ async fn handle_thread_resume(
         let model_req = codex_to_acp::translate_set_session_model(&session_id, model);
         match agent.set_session_model(model_req).await {
             Ok(_) => info!(%thread_id, %model, "session model set on resume"),
-            Err(e) => debug!(%thread_id, %model, "set_session_model on resume failed (non-fatal): {e:?}"),
+            Err(e) => {
+                debug!(%thread_id, %model, "set_session_model on resume failed (non-fatal): {e:?}")
+            }
         }
     }
 
@@ -921,13 +935,10 @@ async fn handle_thread_list(
     agent: &(impl Agent + ?Sized),
     state: &GatewayState,
 ) -> Result<Value, GatewayError> {
-    use crate::rollout::list::{self, ThreadSortKey, parse_cursor};
     use crate::rollout::INTERACTIVE_SESSION_SOURCES;
+    use crate::rollout::list::{self, ThreadSortKey, parse_cursor};
 
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(50) as usize;
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
 
     let cursor = params
         .get("cursor")
@@ -966,10 +977,7 @@ async fn handle_thread_list(
         .items
         .iter()
         .map(|item| {
-            let name = item
-                .thread_id
-                .and_then(|id| names.get(&id))
-                .cloned();
+            let name = item.thread_id.and_then(|id| names.get(&id)).cloned();
             build_thread_json_from_list_item(item, name, &state.threads)
         })
         .collect();
@@ -1000,7 +1008,9 @@ async fn handle_thread_list(
                 if known_ids.contains(&sid) {
                     continue; // Already have this thread locally
                 }
-                let updated = session_info.updated_at.as_deref()
+                let updated = session_info
+                    .updated_at
+                    .as_deref()
                     .and_then(parse_rfc3339_to_unix)
                     .unwrap_or(0);
                 data.push(json!({
@@ -1029,10 +1039,7 @@ async fn handle_thread_list(
 ///
 /// Uses `load_rollout_items()` + `build_turns_from_rollout_items()` for
 /// Codex-compatible Thread JSON with turn reconstruction.
-async fn handle_thread_read(
-    params: &Value,
-    state: &GatewayState,
-) -> Result<Value, GatewayError> {
+async fn handle_thread_read(params: &Value, state: &GatewayState) -> Result<Value, GatewayError> {
     use crate::rollout::list;
     use crate::rollout::recorder::RolloutRecorder;
 
@@ -1178,12 +1185,11 @@ async fn handle_thread_fork(
             agent_nickname: None,
             agent_role: None,
             model_provider: Some(model_provider.clone()),
-            base_instructions: params
-                .get("baseInstructions")
-                .and_then(|v| v.as_str())
-                .map(|text| codex_protocol::models::BaseInstructions {
+            base_instructions: params.get("baseInstructions").and_then(|v| v.as_str()).map(
+                |text| codex_protocol::models::BaseInstructions {
                     text: text.to_string(),
-                }),
+                },
+            ),
             dynamic_tools: None,
         },
         git: source_meta.git,
@@ -1559,10 +1565,8 @@ async fn handle_acp_event(
                 let home = state.rollout.gateway_home().to_path_buf();
                 let title = title.clone();
                 tokio::task::spawn_local(async move {
-                    if let Err(e) = crate::rollout::session_index::append_thread_name(
-                        &home, tid, &title,
-                    )
-                    .await
+                    if let Err(e) =
+                        crate::rollout::session_index::append_thread_name(&home, tid, &title).await
                     {
                         warn!("failed to persist agent-provided title: {e}");
                     }
@@ -1701,10 +1705,7 @@ async fn handle_internal_event(
             state.turn_diffs.remove(&turn_id);
 
             // Transition lifecycle: InTurn → Idle.
-            state.set_lifecycle(
-                thread_id.clone(),
-                SessionLifecycle::Idle { session_id },
-            );
+            state.set_lifecycle(thread_id.clone(), SessionLifecycle::Idle { session_id });
 
             // Notify the Codex client that this thread is now idle.
             let _ = outgoing
@@ -1776,13 +1777,9 @@ async fn handle_thread_name_set(
     let tid = codex_protocol::ThreadId::from_string(thread_id)
         .map_err(|_| GatewayError::Translation(format!("invalid threadId: {thread_id}")))?;
 
-    crate::rollout::session_index::append_thread_name(
-        state.rollout.gateway_home(),
-        tid,
-        name,
-    )
-    .await
-    .map_err(|e| GatewayError::Translation(format!("failed to set thread name: {e}")))?;
+    crate::rollout::session_index::append_thread_name(state.rollout.gateway_home(), tid, name)
+        .await
+        .map_err(|e| GatewayError::Translation(format!("failed to set thread name: {e}")))?;
 
     let _ = outgoing
         .send_notification(
@@ -1833,10 +1830,7 @@ async fn handle_thread_archive(
     state.set_lifecycle(thread_id.to_string(), SessionLifecycle::Closed);
 
     let _ = outgoing
-        .send_notification(
-            "thread/archived",
-            Some(json!({ "threadId": thread_id })),
-        )
+        .send_notification("thread/archived", Some(json!({ "threadId": thread_id })))
         .await;
 
     Ok(json!({}))
@@ -1868,8 +1862,9 @@ async fn handle_thread_unarchive(
     let file_name = source_path
         .file_name()
         .ok_or_else(|| GatewayError::Translation("invalid rollout path".into()))?;
-    let (year, month, day) = list::rollout_date_parts(file_name)
-        .ok_or_else(|| GatewayError::Translation("cannot parse date from rollout filename".into()))?;
+    let (year, month, day) = list::rollout_date_parts(file_name).ok_or_else(|| {
+        GatewayError::Translation("cannot parse date from rollout filename".into())
+    })?;
 
     let dest_dir = gateway_home
         .join(SESSIONS_SUBDIR)
@@ -1894,10 +1889,7 @@ async fn handle_thread_unarchive(
     let created_secs = parse_rfc3339_to_unix(&meta.meta.timestamp).unwrap_or(now_secs);
 
     let _ = outgoing
-        .send_notification(
-            "thread/unarchived",
-            Some(json!({ "threadId": thread_id })),
-        )
+        .send_notification("thread/unarchived", Some(json!({ "threadId": thread_id })))
         .await;
 
     Ok(json!({
@@ -1951,10 +1943,7 @@ fn build_thread_json_from_list_item(
     name: Option<String>,
     threads: &std::collections::HashMap<String, SessionLifecycle>,
 ) -> Value {
-    let thread_id_str = item
-        .thread_id
-        .map(|id| id.to_string())
-        .unwrap_or_default();
+    let thread_id_str = item.thread_id.map(|id| id.to_string()).unwrap_or_default();
     let status = lifecycle_to_thread_status(
         threads
             .get(&thread_id_str)
@@ -1990,7 +1979,9 @@ fn build_thread_json_from_list_item(
 fn lifecycle_to_thread_status(lifecycle: &SessionLifecycle) -> Value {
     match lifecycle {
         SessionLifecycle::Idle { .. } => json!({ "type": "idle" }),
-        SessionLifecycle::InTurn { .. } => json!({ "type": "active", "activeFlags": ["agentTurn"] }),
+        SessionLifecycle::InTurn { .. } => {
+            json!({ "type": "active", "activeFlags": ["agentTurn"] })
+        }
         SessionLifecycle::Closed => json!({ "type": "notLoaded" }),
         _ => json!({ "type": "notLoaded" }),
     }

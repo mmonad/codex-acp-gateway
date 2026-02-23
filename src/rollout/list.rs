@@ -19,13 +19,13 @@ use uuid::Uuid;
 
 use super::ARCHIVED_SESSIONS_SUBDIR;
 use super::SESSIONS_SUBDIR;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::USER_MESSAGE_BEGIN;
-use codex_protocol::ThreadId;
 
 /// Returned page of thread (thread) summaries.
 #[derive(Debug, Default, PartialEq)]

@@ -101,10 +101,7 @@ impl RolloutRecorder {
         let file = match std::fs::File::create(&file_path) {
             Ok(f) => f,
             Err(e) => {
-                warn!(
-                    "failed to create rollout file {}: {e}",
-                    file_path.display()
-                );
+                warn!("failed to create rollout file {}: {e}", file_path.display());
                 return None;
             }
         };
