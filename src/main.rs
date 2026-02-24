@@ -14,7 +14,14 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    if let Err(e) = codex_acp_gateway::run(config).await {
+    let result = match config.mode {
+        codex_acp_gateway::config::GatewayMode::Codex => codex_acp_gateway::run(config).await,
+        codex_acp_gateway::config::GatewayMode::AcpProxy => {
+            codex_acp_gateway::acp_proxy::run(&config).await
+        }
+    };
+
+    if let Err(e) = result {
         tracing::error!("gateway exited with error: {e:#}");
         std::process::exit(1);
     }

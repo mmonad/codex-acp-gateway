@@ -8,6 +8,15 @@ use clap::Parser;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "codex-acp-gateway", about)]
 pub struct GatewayConfig {
+    /// Operating mode.
+    ///
+    /// `codex` (default): Translate between Codex app-server protocol and ACP.
+    /// `acp-proxy`: Transparent WebSocket-to-stdio bridge for ACP — no Codex
+    /// translation, just framing conversion so remote ACP clients can reach a
+    /// local agent subprocess over WebSocket.
+    #[arg(long, default_value = "codex")]
+    pub mode: GatewayMode,
+
     /// Transport endpoint URL. Supported values: `stdio://` (default),
     /// `ws://IP:PORT`.
     #[arg(long = "listen", value_name = "URL", default_value = "stdio://")]
@@ -29,6 +38,38 @@ pub struct GatewayConfig {
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
     pub log_level: String,
+}
+
+/// Gateway operating mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayMode {
+    /// Translate between Codex app-server protocol and ACP.
+    Codex,
+    /// Transparent WS-to-stdio ACP proxy (no protocol translation).
+    AcpProxy,
+}
+
+impl FromStr for GatewayMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "codex" => Ok(Self::Codex),
+            "acp-proxy" => Ok(Self::AcpProxy),
+            _ => Err(format!(
+                "unknown mode: {s:?} (expected 'codex' or 'acp-proxy')"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for GatewayMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Codex => write!(f, "codex"),
+            Self::AcpProxy => write!(f, "acp-proxy"),
+        }
+    }
 }
 
 /// Transport mode for the Codex client side.

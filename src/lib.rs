@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod acp_proxy;
 pub mod config;
 pub mod error;
 pub mod rollout;

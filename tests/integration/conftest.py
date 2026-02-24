@@ -552,3 +552,312 @@ def ws_thread(ws_initialized_gateway) -> tuple[WsGatewaySession, str]:
     """
     thread_id = ws_initialized_gateway.thread_start()
     return ws_initialized_gateway, thread_id
+
+
+# ── AcpProxySession (acp-proxy mode) ────────────────────────
+
+
+class AcpProxySession:
+    """Speaks raw ACP JSON-RPC 2.0 over WebSocket to the gateway in acp-proxy mode.
+
+    Unlike the Codex sessions above, messages include ``"jsonrpc": "2.0"``
+    and use ACP method names (``session/new``, ``session/prompt``, etc.).
+    The proxy passes them through to the agent subprocess unmodified.
+    """
+
+    def __init__(
+        self,
+        ws: ws_client.WebSocket,
+        proc: Optional[subprocess.Popen] = None,
+        port: int = 0,
+    ):
+        self.ws = ws
+        self.proc = proc
+        self.port = port
+        self._owns_proc = proc is not None
+        self._next_id = 1
+        self.stderr_lines: list = []
+        self._stderr_thread: Optional[threading.Thread] = None
+
+    @classmethod
+    def start(
+        cls,
+        agent_cmd: str = "gemini",
+        agent_args: list[str] | None = None,
+        log_level: str = "info",
+    ) -> AcpProxySession:
+        """Start the gateway in acp-proxy mode and connect one WS client."""
+        if agent_args is None:
+            agent_args = ["--experimental-acp"]
+
+        port = _find_free_port()
+        listen_url = f"ws://127.0.0.1:{port}"
+
+        cmd = [
+            _gateway_bin(),
+            "--mode",
+            "acp-proxy",
+            "--listen",
+            listen_url,
+            "--agent-cmd",
+            agent_cmd,
+            "--log-level",
+            log_level,
+            "--",
+            *agent_args,
+        ]
+
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+
+        stderr_lines: list = []
+        stderr_thread = _start_stderr_reader(proc, stderr_lines)
+
+        ws = None
+        for _attempt in range(30):
+            try:
+                ws = ws_client.create_connection(listen_url, timeout=2)
+                break
+            except (ConnectionRefusedError, ConnectionResetError, OSError):
+                time.sleep(0.3)
+
+        if ws is None:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(
+                f"ACP proxy did not start listening on {listen_url} within 10s. "
+                f"stderr: {stderr_lines[-5:]}"
+            )
+
+        session = cls(ws=ws, proc=proc, port=port)
+        session.stderr_lines = stderr_lines
+        session._stderr_thread = stderr_thread
+        return session
+
+    def close(self):
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+        if self._owns_proc and self.proc is not None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+
+    # ── transport I/O ─────────────────────────────────────────
+
+    def send(self, msg: dict):
+        """Send a raw ACP JSON-RPC 2.0 message."""
+        _log_send(msg)
+        self.ws.send(json.dumps(msg, separators=(",", ":")))
+
+    def recv(self, timeout: float = 30) -> Optional[dict]:
+        """Receive one ACP JSON-RPC 2.0 message."""
+        self.ws.settimeout(timeout)
+        try:
+            data = self.ws.recv()
+            if data:
+                msg = json.loads(data)
+                _log_recv(msg)
+                return msg
+        except ws_client.WebSocketTimeoutException:
+            return None
+        except (ws_client.WebSocketConnectionClosedException, ConnectionError):
+            return None
+        return None
+
+    # ── ACP protocol helpers ──────────────────────────────────
+
+    def send_request(self, method: str, params: dict | None = None) -> int:
+        """Send an ACP JSON-RPC 2.0 request. Returns its ID."""
+        req_id = self._next_id
+        self._next_id += 1
+        msg: dict = {"jsonrpc": "2.0", "id": req_id, "method": method}
+        if params is not None:
+            msg["params"] = params
+        self.send(msg)
+        return req_id
+
+    def send_notification(self, method: str, params: dict | None = None):
+        """Send an ACP JSON-RPC 2.0 notification (no id)."""
+        msg: dict = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            msg["params"] = params
+        self.send(msg)
+
+    def recv_until_response(
+        self, request_id: int, timeout: float = 30
+    ) -> tuple[Optional[dict], list[dict]]:
+        """Read messages until we get the response for *request_id*.
+
+        Returns ``(response, collected_notifications)``.
+        """
+        notifications: list[dict] = []
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            msg = self.recv(timeout=max(0.1, remaining))
+            if msg is None:
+                break
+            if msg.get("id") == request_id and ("result" in msg or "error" in msg):
+                return msg, notifications
+            notifications.append(msg)
+        return None, notifications
+
+    # ── high-level ACP actions ────────────────────────────────
+
+    def initialize(self) -> dict:
+        """Perform the ACP initialize handshake. Returns the result."""
+        req_id = self.send_request(
+            "initialize",
+            {
+                "protocolVersion": 1,
+                "implementation": {"name": "test-client", "version": "0.0.1"},
+                "clientCapabilities": {},
+            },
+        )
+        resp, _ = self.recv_until_response(req_id, timeout=30)
+        assert resp is not None, "ACP initialize timed out"
+        assert "result" in resp, f"ACP initialize failed: {resp.get('error', {})}"
+        self.send_notification("initialized")
+        time.sleep(0.3)
+        return resp["result"]
+
+    def new_session(self, cwd: str | None = None, **kwargs) -> str:
+        """Create a new ACP session. Returns the session ID."""
+        if cwd is None:
+            cwd = os.getcwd()
+        params = {"cwd": cwd, "mcpServers": [], **kwargs}
+        req_id = self.send_request("session/new", params)
+        resp, _ = self.recv_until_response(req_id, timeout=15)
+        assert resp is not None, "session/new timed out"
+        assert "result" in resp, f"session/new failed: {resp.get('error', {})}"
+        return resp["result"]["sessionId"]
+
+    def prompt(
+        self, session_id: str, text: str, timeout: float = 90
+    ) -> tuple[dict, list[dict]]:
+        """Send a prompt and collect all notifications until the response.
+
+        Returns ``(prompt_response, notifications)``.
+        """
+        req_id = self.send_request(
+            "session/prompt",
+            {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": text}],
+            },
+        )
+        resp, notifications = self.recv_until_response(req_id, timeout=timeout)
+        assert resp is not None, "session/prompt timed out"
+        assert "result" in resp, f"session/prompt failed: {resp.get('error', {})}"
+        return resp["result"], notifications
+
+    def prompt_or_skip(
+        self, session_id: str, text: str, timeout: float = 90
+    ) -> tuple[dict, list[dict]]:
+        """Like ``prompt()`` but auto-approves permissions and skips on capacity errors."""
+        req_id = self.send_request(
+            "session/prompt",
+            {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": text}],
+            },
+        )
+        notifications: list[dict] = []
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            msg = self.recv(timeout=max(0.1, remaining))
+            if msg is None:
+                break
+
+            # Permission request from agent — auto-approve
+            method = msg.get("method", "")
+            if method == "session/request_permission" and "id" in msg:
+                options = msg.get("params", {}).get("options", [])
+                allow_id = None
+                for opt in options:
+                    if opt.get("kind") in ("AllowOnce", "AllowAlways"):
+                        allow_id = opt.get("optionId")
+                        break
+                if allow_id is None and options:
+                    allow_id = options[0].get("optionId")
+                self.send({
+                    "jsonrpc": "2.0",
+                    "id": msg["id"],
+                    "result": {
+                        "outcome": {"type": "Selected", "optionId": allow_id},
+                    },
+                })
+                continue
+
+            # Our response?
+            if msg.get("id") == req_id and ("result" in msg or "error" in msg):
+                if "error" in msg:
+                    err_msg = msg["error"].get("message", "")
+                    if "capacity" in err_msg.lower() or "overloaded" in err_msg.lower():
+                        pytest.skip(f"Gemini server capacity issue: {err_msg}")
+                    raise AssertionError(f"session/prompt failed: {msg['error']}")
+                return msg["result"], notifications
+
+            notifications.append(msg)
+
+        raise AssertionError("session/prompt timed out")
+
+    def collect_agent_text(self, notifications: list[dict]) -> str:
+        """Extract agent message text from session/update notifications.
+
+        ACP uses ``sessionUpdate`` as the discriminator field with snake_case
+        variant names (e.g. ``agent_message_chunk``).  The text content is in
+        ``content.text`` (a ``ContentBlock``).
+        """
+        chunks = []
+        for n in notifications:
+            if n.get("method") == "session/update":
+                update = n.get("params", {}).get("update", {})
+                session_update = update.get("sessionUpdate", "")
+                if session_update == "agent_message_chunk":
+                    content = update.get("content", {})
+                    text = content.get("text", "")
+                    if text:
+                        chunks.append(text)
+        return "".join(chunks)
+
+
+# ── Pytest Fixtures: ACP Proxy ──────────────────────────────
+
+
+@pytest.fixture
+def acp_proxy():
+    """Yield a started AcpProxySession, closed automatically after the test."""
+    session = AcpProxySession.start()
+    yield session
+    session.close()
+
+
+@pytest.fixture
+def acp_proxy_debug():
+    """Same as acp_proxy but with debug logging."""
+    session = AcpProxySession.start(log_level="debug")
+    yield session
+    session.close()
+
+
+@pytest.fixture
+def acp_initialized(acp_proxy):
+    """An ACP proxy session that has completed the initialize handshake."""
+    acp_proxy.initialize()
+    return acp_proxy
+
+
+@pytest.fixture
+def acp_session(acp_initialized) -> tuple[AcpProxySession, str]:
+    """An initialized ACP proxy with one session already created.
+
+    Returns ``(proxy, session_id)``.
+    """
+    session_id = acp_initialized.new_session()
+    return acp_initialized, session_id
