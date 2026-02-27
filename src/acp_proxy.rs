@@ -7,14 +7,19 @@
 //!   WS text message  ⟷  NDJSON line on stdin/stdout
 //!
 //! Each WebSocket connection gets its own agent subprocess.
+//!
+//! A small set of **gateway-handled methods** (e.g. `command/exec`) are
+//! intercepted and executed locally instead of being forwarded to the agent.
 
 use std::net::SocketAddr;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
@@ -61,6 +66,38 @@ pub async fn run(config: &GatewayConfig) -> Result<()> {
     }
 }
 
+/// Try to handle a JSON-RPC request locally.  Returns `Some(response_json)`
+/// if the method was intercepted, or `None` if it should be forwarded to the
+/// agent.
+async fn try_handle_locally(text: &str, cwd: &Path) -> Option<String> {
+    let msg: Value = serde_json::from_str(text).ok()?;
+    let method = msg.get("method")?.as_str()?;
+    let id = msg.get("id").cloned()?;
+
+    match method {
+        "command/exec" => {
+            let params = msg.get("params").cloned().unwrap_or(json!({}));
+            let response = match crate::command_exec::run(&params, cwd).await {
+                Ok(result) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                }),
+                Err(e) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32603,
+                        "message": format!("{e}"),
+                    },
+                }),
+            };
+            Some(response.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// Handle a single ACP client WebSocket connection by bridging it to an
 /// agent subprocess.
 async fn handle_connection(
@@ -88,26 +125,59 @@ async fn handle_connection(
 
     info!(%peer, pid = child.id().unwrap_or(0), "agent subprocess spawned");
 
-    // Task: agent stdout → WS (each NDJSON line becomes a WS text message)
+    // Channel for locally-handled responses that need to go back to the WS
+    // client without passing through the agent.
+    let (local_tx, mut local_rx) = mpsc::channel::<String>(16);
+
+    // Task: agent stdout → WS, plus locally-handled responses → WS.
     let stdout_to_ws = async {
-        while let Ok(Some(line)) = stdout_reader.next_line().await {
-            debug!(%peer, direction = "agent→ws", len = line.len(), "forwarding");
-            if ws_write.send(Message::Text(line.into())).await.is_err() {
-                debug!(%peer, "WS write failed, stopping stdout→ws");
-                break;
+        loop {
+            tokio::select! {
+                line = stdout_reader.next_line() => {
+                    match line {
+                        Ok(Some(line)) => {
+                            debug!(%peer, direction = "agent→ws", len = line.len(), "forwarding");
+                            if ws_write.send(Message::Text(line.into())).await.is_err() {
+                                debug!(%peer, "WS write failed, stopping stdout→ws");
+                                break;
+                            }
+                        }
+                        _ => {
+                            // Agent closed stdout — send WS close frame.
+                            let _ = ws_write.send(Message::Close(None)).await;
+                            debug!(%peer, "agent stdout closed");
+                            break;
+                        }
+                    }
+                }
+                Some(response) = local_rx.recv() => {
+                    debug!(%peer, direction = "local→ws", len = response.len(), "sending local response");
+                    if ws_write.send(Message::Text(response.into())).await.is_err() {
+                        debug!(%peer, "WS write failed, stopping local→ws");
+                        break;
+                    }
+                }
             }
         }
-        // Agent closed stdout — send WS close frame.
-        let _ = ws_write.send(Message::Close(None)).await;
-        debug!(%peer, "agent stdout closed");
     };
 
-    // Task: WS → agent stdin (each WS text message becomes an NDJSON line)
+    // Task: WS → agent stdin (with interception for gateway-handled methods)
+    let cwd = cwd.to_path_buf();
     let ws_to_stdin = async {
         while let Some(frame) = ws_read.next().await {
             match frame {
                 Ok(Message::Text(text)) => {
                     let text: &str = &text;
+
+                    // Check if this is a gateway-handled method.
+                    if let Some(response) = try_handle_locally(text, &cwd).await {
+                        debug!(%peer, direction = "ws→local", "intercepted gateway method");
+                        if local_tx.send(response).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+
                     debug!(%peer, direction = "ws→agent", len = text.len(), "forwarding");
                     let mut line = text.as_bytes().to_vec();
                     if !text.ends_with('\n') {

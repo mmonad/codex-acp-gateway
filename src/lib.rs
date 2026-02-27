@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod acp_proxy;
+pub mod command_exec;
 pub mod config;
 pub mod error;
 pub mod rollout;
@@ -1387,55 +1388,9 @@ async fn handle_thread_rollback(
 /// a build tool). The gateway handles it directly without involving the ACP
 /// agent.
 async fn handle_command_exec(params: &Value, cwd: &std::path::Path) -> Result<Value, GatewayError> {
-    let command: Vec<String> = params
-        .get("command")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .ok_or_else(|| GatewayError::Translation("command/exec: missing 'command' array".into()))?;
-
-    if command.is_empty() {
-        return Err(GatewayError::Translation(
-            "command/exec: empty command array".into(),
-        ));
-    }
-
-    let timeout_ms = params
-        .get("timeoutMs")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(30_000);
-
-    let exec_cwd = params
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| cwd.to_path_buf());
-
-    debug!(cmd = ?command, cwd = %exec_cwd.display(), "command/exec");
-
-    let child = tokio::process::Command::new(&command[0])
-        .args(&command[1..])
-        .current_dir(&exec_cwd)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| GatewayError::Translation(format!("command/exec spawn failed: {e}")))?;
-
-    let output = tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms as u64),
-        child.wait_with_output(),
-    )
-    .await
-    .map_err(|_| GatewayError::Translation(format!("command/exec timed out after {timeout_ms}ms")))?
-    .map_err(|e| GatewayError::Translation(format!("command/exec failed: {e}")))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let exit_code = output.status.code().unwrap_or(-1);
-    Ok(json!({
-        "exitCode": exit_code,
-        "stdout": stdout,
-        "stderr": stderr,
-    }))
+    command_exec::run(params, cwd)
+        .await
+        .map_err(|e| GatewayError::Translation(format!("{e}")))
 }
 
 /// Handle `fuzzyFileSearch` — perform a one-shot fuzzy file search.
