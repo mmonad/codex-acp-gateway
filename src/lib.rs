@@ -4,6 +4,7 @@ pub mod command_exec;
 pub mod config;
 pub mod error;
 pub mod rollout;
+pub mod sandbox;
 pub mod translation;
 pub mod transport;
 

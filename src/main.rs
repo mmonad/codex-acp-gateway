@@ -14,6 +14,9 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    // Detect bwrap availability once at startup (result is cached).
+    codex_acp_gateway::sandbox::check_availability();
+
     let result = match config.mode {
         codex_acp_gateway::config::GatewayMode::Codex => codex_acp_gateway::run(config).await,
         codex_acp_gateway::config::GatewayMode::AcpProxy => {

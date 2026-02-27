@@ -406,6 +406,7 @@ dependencies = [
  "codex-app-server-protocol",
  "codex-file-search",
  "codex-protocol",
+ "codex-utils-absolute-path",
  "dirs",
  "futures",
  "pretty_assertions",
