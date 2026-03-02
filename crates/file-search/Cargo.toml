@@ -3,10 +3,7 @@ name = "codex-file-search"
 version = "0.0.0"
 edition.workspace = true
 license.workspace = true
-
-[[bin]]
-name = "codex-file-search"
-path = "src/main.rs"
+autobins = false
 
 [lib]
 name = "codex_file_search"
