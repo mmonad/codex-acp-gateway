@@ -26,3 +26,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 # Note: uv.lock IS version-controlled (not ignored)
+
+# AI assistant config (user-specific)
+.claude/

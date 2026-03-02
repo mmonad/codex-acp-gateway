@@ -1,0 +1,5 @@
+codex-acp-gateway
+Copyright 2025 OpenAI
+
+This project includes vendored code from OpenAI Codex
+(https://github.com/openai/codex), licensed under the Apache License 2.0.

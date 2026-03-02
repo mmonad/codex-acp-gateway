@@ -397,7 +397,7 @@ checksum = "e9b18233253483ce2f65329a24072ec414db782531bdbb7d0bbc4bd2ce6b7e21"
 
 [[package]]
 name = "codex-acp-gateway"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "codex-app-server-protocol"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "codex-execpolicy"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "codex-experimental-api-macros"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "codex-file-search"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "codex-git"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "assert_matches",
  "once_cell",
@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "codex-protocol"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "codex-execpolicy",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-absolute-path"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "dirs",
  "path-absolutize",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-cache"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "lru",
  "sha1",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-image"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "base64",
  "codex-utils-cache",

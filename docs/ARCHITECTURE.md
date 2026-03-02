@@ -2,10 +2,15 @@
 
 ## Overview
 
-codex-acp-gateway is a protocol translation gateway that bridges the Codex
-app-server protocol with the Agent Client Protocol (ACP). It enables any Codex
-client (VS Code extension, CLI, web) to use any ACP-compliant agent as its
-backend.
+codex-acp-gateway is a protocol translation gateway and WebSocket proxy for
+ACP (Agent Client Protocol) agents. It operates in two modes:
+
+- **Codex mode**: Translates between the Codex app-server protocol and ACP,
+  enabling any Codex client (VS Code extension, CLI, web) to use any
+  ACP-compliant agent as its backend.
+- **ACP proxy mode**: Exposes any stdio-based ACP agent over WebSocket with no
+  protocol translation — just framing conversion so remote ACP clients can
+  reach a local agent subprocess over the network.
 
 ## Protocol comparison
 
@@ -138,17 +143,38 @@ Codex Client                Gateway                    ACP Agent
 ### `src/main.rs`
 Entry point. Parses CLI arguments, initializes tracing, sets up the tokio
 runtime with a `LocalSet` (required for ACP's !Send futures), and orchestrates
-the gateway lifecycle.
+the gateway lifecycle. Routes to codex mode or ACP proxy mode based on `--mode`.
+
+### `src/lib.rs`
+Module declarations and session orchestration. Contains `run_session()` — the
+core event loop that `select!`s on both the Codex transport channel and ACP
+events, dispatching to the translation engine.
 
 ### `src/config.rs`
 Defines the CLI interface using clap. Key options:
+- `--mode`: `codex` (default) or `acp-proxy`
 - `--listen`: transport URL — `stdio://` (default) or `ws://IP:PORT`
 - `--agent-cmd`: path/name of the ACP agent binary
+- `--cwd`: working directory for the agent subprocess
 - Remaining args after `--`: forwarded to the agent process
 
 ### `src/error.rs`
 Gateway-specific error types using thiserror. Covers transport errors, protocol
 translation errors, and subprocess management failures.
+
+### `src/acp_proxy.rs`
+ACP proxy mode implementation. Accepts WebSocket connections and bridges each
+one to its own ACP agent subprocess via stdin/stdout NDJSON. No protocol
+translation — just framing conversion (WebSocket Text frames <-> newline-delimited
+JSON lines).
+
+### `src/command_exec.rs`
+Sandbox-aware subprocess execution for ACP terminal callbacks. Wraps commands
+through the sandbox policy before spawning.
+
+### `src/sandbox.rs`
+Bubblewrap (`bwrap`) sandbox integration. Provides `wrap_command()` which
+translates a `SandboxPolicy` into bwrap bind-mount and namespace flags.
 
 ### `src/transport/`
 Codex-side transport layer (pluggable: stdio or WebSocket):
@@ -159,29 +185,38 @@ Codex-side transport layer (pluggable: stdio or WebSocket):
 
 ### `src/acp/`
 ACP subprocess management and Client trait implementation:
-- **Process manager**: Spawns the ACP agent binary, manages its stdin/stdout/stderr
-- **Client impl**: Implements the ACP `Client` trait to handle callbacks:
+- **spawn**: Spawns the ACP agent binary, manages its stdin/stdout/stderr
+- **client_impl**: Implements the ACP `Client` trait to handle callbacks:
   - `request_permission` -> forwards to Codex client as approval request
   - `session_notification` -> translates and forwards to Codex as item/* notifications
-  - `fs/readTextFile`, `fs/writeTextFile` -> handles locally via std::fs
-  - `terminal/*` -> manages subprocesses locally via tokio::process
+- **fs_handler**: `fs/readTextFile`, `fs/writeTextFile` -> handles locally via std::fs
+- **terminal_handler**: `terminal/*` -> manages subprocesses locally via tokio::process
 
 ### `src/translation/`
 Bidirectional protocol translation engine:
-- **Codex-to-ACP**: Translates incoming Codex requests to ACP method calls
+- **codex_to_acp**: Translates incoming Codex requests to ACP method calls
   - `initialize` params mapping (ClientInfo <-> Implementation)
   - `thread/start` -> `session/new` (ThreadStartParams -> NewSessionRequest)
   - `turn/start` -> `session/prompt` (TurnStartParams + InputItem[] -> PromptRequest + ContentBlock[])
   - `turn/interrupt` -> `session/cancel`
-- **ACP-to-Codex**: Translates ACP events to Codex notifications
+- **acp_to_codex**: Translates ACP events to Codex notifications
   - `SessionUpdate::AgentMessageChunk` -> `item/agentMessage/delta`
   - `SessionUpdate::ToolCall` -> `item/started` + tool-specific notifications
   - `SessionUpdate::ToolCallUpdate` -> delta notifications + `item/completed`
   - `SessionUpdate::Plan` -> `item/plan/delta`
   - `PromptResponse` (stop_reason) -> `turn/completed`
-- **Approval translation**: Maps between ACP `RequestPermissionRequest` and Codex
+- **approval**: Maps between ACP `RequestPermissionRequest` and Codex
   `CommandExecutionRequestApprovalParams` / `FileChangeRequestApprovalParams`
-- **ID correlation**: Maintains a bidirectional map of Codex request IDs <-> ACP request IDs
+- **ext_method**: Handles ACP extension methods (`tool/call`, `request_user_input`)
+- **content**: Content block translation (InputItem <-> ContentBlock)
+- **id_map**: Bidirectional map of Codex request IDs <-> ACP request IDs
+- **state**: Translation state machine tracking
+
+### `src/rollout/`
+Thread history persistence and listing:
+- **recorder**: Writes turn events to per-thread rollout files
+- **list**: Paginated listing of recorded threads with cursor-based pagination
+- **session_index**: Manages the thread/session index file
 
 ## Key types from each protocol
 

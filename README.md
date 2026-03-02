@@ -1,19 +1,38 @@
 # codex-acp-gateway
 
-A protocol translation gateway that enables any
-[Codex](https://github.com/openai/codex) app-server client to communicate with
-any [ACP](https://agentclientprotocol.com/) (Agent Client Protocol) agent.
+A protocol translation gateway and WebSocket proxy for
+[ACP](https://agentclientprotocol.com/) (Agent Client Protocol) agents.
 
-Codex clients speak a custom JSON-RPC dialect over stdio (NDJSON without the
-`"jsonrpc"` field). ACP agents speak standard JSON-RPC 2.0 over stdio (NDJSON
-with `"jsonrpc": "2.0"`). The gateway sits between them and translates
-bidirectionally.
+The gateway operates in two modes:
 
+- **`codex` mode** — Translate between [Codex](https://github.com/openai/codex)
+  app-server protocol and ACP, so any Codex client can use any ACP agent.
+- **`acp-proxy` mode** — Expose any stdio-based ACP agent over WebSocket, so
+  remote ACP clients (Zed, JetBrains, Neovim, etc.) can reach it over the
+  network.
+
+#### Codex mode
+
+```mermaid
+flowchart LR
+  codex["Codex client<br/>(VS Code, CLI)"]
+  gw["codex-acp-gateway<br/>protocol translation"]
+  agent["ACP agent<br/>(Gemini, etc.)"]
+
+  codex <-->|"stdio or WebSocket"| gw
+  gw <-->|stdio| agent
 ```
- Codex Client           codex-acp-gateway             ACP Agent
- (VS Code, CLI)  <--->  [translate + proxy]  <--->  (Gemini, etc.)
-     stdio NDJSON            Rust / tokio            stdio NDJSON
-  (no "jsonrpc")                                  ("jsonrpc":"2.0")
+
+#### ACP proxy mode
+
+```mermaid
+flowchart LR
+  client["ACP client<br/>(Zed, JetBrains)"]
+  gw["codex-acp-gateway<br/>WebSocket ⇄ stdio proxy"]
+  agent["ACP agent<br/>(Gemini, Claude, etc.)"]
+
+  client <-->|WebSocket| gw
+  gw <-->|stdio| agent
 ```
 
 ## Why
@@ -23,11 +42,16 @@ emerging open protocol backed by Google, Zed, and others that many agents are
 adopting. This gateway lets you use any ACP agent as the backend for any Codex
 client without modifying either side.
 
+The ACP proxy mode is useful when you want to expose a local ACP agent (which
+normally communicates over stdio) to remote clients over WebSocket — for
+example, running a Gemini or Claude Code agent on a dev server and connecting
+to it from an editor on another machine.
+
 ## Installation
 
 ```bash
 # Clone and build
-git clone <repo-url> && cd codex-acp-gateway
+git clone https://github.com/mmonad/codex-acp-gateway.git && cd codex-acp-gateway
 cargo build --release
 
 # Binary is at target/release/codex-acp-gateway
@@ -37,35 +61,76 @@ Requires Rust 2024 edition (1.85+).
 
 ## Usage
 
+### Codex mode (default)
+
+Translate between Codex app-server protocol and ACP:
+
 ```bash
-# Stdio mode (default) — pipe Codex protocol on stdin/stdout
+# Stdio mode — pipe Codex protocol on stdin/stdout
 codex-acp-gateway --agent-cmd <agent-binary> [-- agent-args...]
 
 # WebSocket mode — accept Codex clients over WebSocket
 codex-acp-gateway --listen ws://0.0.0.0:8080 --agent-cmd <agent-binary> [-- agent-args...]
 
-# Example: use a Gemini ACP agent with Codex CLI
+# Example: use Gemini as a Codex agent
 codex-acp-gateway --agent-cmd gemini -- --experimental-acp
 ```
 
+### ACP proxy mode
+
+Expose any stdio-based ACP agent over WebSocket with no protocol translation —
+the gateway just bridges WebSocket frames to stdin/stdout NDJSON. Each WebSocket
+connection gets its own agent subprocess.
+
+```bash
+codex-acp-gateway --mode acp-proxy --listen ws://0.0.0.0:7003 \
+  --agent-cmd <agent-binary> [-- agent-args...]
+```
+
+#### Example: Gemini over WebSocket
+
+```bash
+codex-acp-gateway --mode acp-proxy --listen ws://0.0.0.0:7003 \
+  --agent-cmd gemini -- --experimental-acp
+```
+
+#### Example: Claude Code over WebSocket
+
+Claude Code does not natively support ACP, but the
+[claude-agent-acp](https://github.com/zed-industries/claude-agent-acp) adapter
+(by Zed Industries) wraps the Claude Code CLI as an ACP agent.
+
+Install the adapter:
+
+```bash
+npm install -g @zed-industries/claude-agent-acp
+```
+
+Then run the gateway:
+
+```bash
+codex-acp-gateway --mode acp-proxy --listen ws://0.0.0.0:7003 \
+  --cwd ~/my-project \
+  --agent-cmd claude-agent-acp
+```
+
+This spawns a `claude-agent-acp` subprocess for each WebSocket connection. The
+adapter manages the Claude Code CLI internally — you need a working `claude`
+installation and valid Anthropic credentials (via `ANTHROPIC_API_KEY` or
+`claude /login`).
+
 ### Transport modes
 
-The `--listen` flag controls how Codex clients connect to the gateway:
+The `--listen` flag controls how clients connect to the gateway:
 
 | Value              | Behavior                                             |
 |--------------------|------------------------------------------------------|
-| `stdio://` (default) | Read/write Codex NDJSON on stdin/stdout. Single client, exit on EOF. |
+| `stdio://` (default) | Read/write on stdin/stdout. Single client, exit on EOF. |
 | `ws://IP:PORT`     | Accept WebSocket connections. Each client gets its own ACP agent subprocess. |
-
-In stdio mode, the gateway reads Codex protocol messages from stdin and writes
-responses to stdout.
-
-In WebSocket mode, the gateway listens for connections on the given address.
-Each connected client gets an independent ACP agent subprocess — there is no
-shared state between connections.
 
 ### Options
 
+- `--mode <MODE>` — `codex` (default) or `acp-proxy`
 - `--agent-cmd` — path or name of the ACP agent binary to spawn
 - `--listen <URL>` — transport endpoint (`stdio://` or `ws://IP:PORT`)
 - `--cwd <PATH>` — working directory for the agent subprocess (default: `.`)
@@ -103,19 +168,26 @@ codex-acp-gateway/
   Cargo.toml                  Workspace root + gateway binary
   src/
     main.rs                   Entry point, CLI parsing, runtime setup
-    config.rs                 CLI args and configuration
+    lib.rs                    Module declarations, session orchestration
+    config.rs                 CLI args and configuration (clap)
     error.rs                  Gateway error types
+    acp_proxy.rs              ACP proxy mode (WS-to-stdio bridge, no translation)
+    command_exec.rs           Sandbox-aware subprocess execution
+    sandbox.rs                Bubblewrap (bwrap) sandbox integration
     transport/                Codex-side transport (stdio NDJSON + WebSocket)
     acp/                      ACP subprocess management + Client trait impl
     translation/              Bidirectional protocol translation engine
-  crates/                     Vendored from codex, maintained locally
+    rollout/                  Thread history persistence and listing
+  crates/                     Vendored from codex (Apache-2.0), maintained locally
     app-server-protocol/      Codex wire types (JSON-RPC messages, v1/v2)
     protocol/                 codex-protocol (core domain types)
     codex-experimental-api-macros/
     execpolicy/               Sandbox execution policy
+    file-search/              Fuzzy file search
     utils/                    Transitive deps (absolute-path, cache, image, git)
   docs/
     ARCHITECTURE.md           Deep technical architecture documentation
+    GAP_ANALYSIS.md           Protocol coverage audit and known gaps
 ```
 
 ## Key dependencies

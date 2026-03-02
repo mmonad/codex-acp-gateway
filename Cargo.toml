@@ -14,9 +14,10 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "Apache-2.0"
+repository = "https://github.com/mmonad/codex-acp-gateway"
 
 [workspace.dependencies]
 # Internal path dependencies (vendored from codex)
@@ -83,9 +84,11 @@ rust = {}
 
 [package]
 name = "codex-acp-gateway"
+description = "Protocol translation gateway between Codex app-server clients and ACP agents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "codex-acp-gateway"
