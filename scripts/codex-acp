@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Launch Codex with one shared agent/model menu, or a named agent."""
+
+import argparse, json, os, pathlib, shutil, signal, socket, subprocess, sys, time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("agent", nargs="?", default="all")
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument(
+        "--config", default=str(pathlib.Path.home() / ".codex/acp/agents.json")
+    )
+    args, extra = parser.parse_known_args()
+    config = json.loads(pathlib.Path(args.config).expanduser().read_text())
+    if args.list:
+        for name, agent in config["agents"].items():
+            print(f"{name:16} {agent['command']}")
+        return 0
+    if args.agent != "all" and args.agent not in config["agents"]:
+        parser.error(f"Unknown agent: {args.agent}; use --list")
+    if args.agent == "all":
+        default = config.get("default_agent", "antigravity")
+        initial = config["agents"][default]
+        router = pathlib.Path(__file__).resolve().with_name("codex-acp-router")
+        if not router.exists():
+            parser.error(f"Missing shared router: {router}")
+        agent = {
+            "command": str(router),
+            "backend": "router",
+            "args": [
+                str(pathlib.Path(args.config).expanduser()),
+                shutil.which("codex-acp-gateway"),
+            ],
+            "model": default + "/" + initial["model"],
+            "effort": initial.get("effort"),
+        }
+    else:
+        agent = config["agents"][args.agent]
+    gateway = shutil.which("codex-acp-gateway")
+    if not gateway:
+        parser.error("codex-acp-gateway is not installed on PATH")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    env = os.environ.copy()
+    env.update(agent.get("env", {}))
+    env["ACP_ALLOWED_MODELS"] = ",".join(agent.get("models", []))
+    data = pathlib.Path.home() / ".codex/acp" / args.agent
+    data.mkdir(parents=True, exist_ok=True)
+    env["ACP_GATEWAY_HOME"] = str(data)
+    saved = data / "client-config.json"
+    if saved.exists():
+        preferences = json.loads(saved.read_text())
+        agent = {
+            **agent,
+            "model": preferences.get("model", agent.get("model")),
+            "effort": preferences.get("model_reasoning_effort", agent.get("effort")),
+        }
+    command = [
+        gateway,
+        "--backend",
+        agent.get("backend", "acp"),
+        "--listen",
+        f"ws://127.0.0.1:{port}",
+        "--cwd",
+        os.getcwd(),
+        "--agent-cmd",
+        str(pathlib.Path(agent["command"]).expanduser()),
+        "--",
+        *agent.get("args", []),
+    ]
+    log_path = data / "gateway.log"
+    with log_path.open("a") as log:
+        process = subprocess.Popen(
+            command, env=env, stderr=log, stdout=log, start_new_session=True
+        )
+        try:
+            for _ in range(100):
+                if process.poll() is not None:
+                    raise RuntimeError(f"Gateway stopped; see {log_path}")
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                        pass
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                raise RuntimeError(f"Gateway did not start; see {log_path}")
+            cmd = ["codex", "--remote", f"ws://127.0.0.1:{port}"]
+            resuming = "resume" in extra[:2]
+            if agent.get("model") and not resuming:
+                cmd += ["--model", agent["model"]]
+            if agent.get("effort") and not resuming:
+                cmd += ["-c", "model_reasoning_effort=" + json.dumps(agent["effort"])]
+            if extra[:1] == ["--"]:
+                extra = extra[1:]
+            return subprocess.call(cmd + extra)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, RuntimeError) as error:
+        sys.exit(str(error))

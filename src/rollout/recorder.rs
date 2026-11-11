@@ -42,11 +42,13 @@ impl std::fmt::Debug for RolloutRecorder {
 impl RolloutRecorder {
     /// Create a new recorder. `gateway_home` defaults to `~/.codex-acp-gateway/`.
     pub fn new(gateway_home: Option<PathBuf>) -> Self {
-        let gateway_home = gateway_home.unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".codex-acp-gateway")
-        });
+        let gateway_home = gateway_home
+            .or_else(|| std::env::var_os("ACP_GATEWAY_HOME").map(PathBuf::from))
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".codex-acp-gateway")
+            });
         Self {
             gateway_home,
             open_files: HashMap::new(),

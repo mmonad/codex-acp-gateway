@@ -48,6 +48,7 @@ pub struct GatewayState {
     /// Agent's model selection state, populated from session creation/load
     /// responses when the agent advertises `unstable_session_model` support.
     pub model_state: Option<SessionModelState>,
+    pub catalog_cache: Option<serde_json::Value>,
     /// Rollout recorder for persisting thread history to disk.
     /// Uses Codex-compatible `RolloutLine`/`RolloutItem` NDJSON format.
     pub rollout: RolloutRecorder,
@@ -66,6 +67,7 @@ impl GatewayState {
             session_config: HashMap::new(),
             turn_diffs: HashMap::new(),
             model_state: None,
+            catalog_cache: None,
             rollout: RolloutRecorder::default(),
         }
     }

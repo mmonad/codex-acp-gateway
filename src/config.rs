@@ -22,6 +22,10 @@ pub struct GatewayConfig {
     #[arg(long = "listen", value_name = "URL", default_value = "stdio://")]
     pub listen: ListenTransport,
 
+    /// Backend protocol: acp, muse-msp, or router (NDJSON app-server router).
+    #[arg(long, default_value = "acp", value_parser = ["acp", "muse-msp", "router"])]
+    pub backend: String,
+
     /// Command to spawn as the ACP agent (e.g. "gemini").
     #[arg(long)]
     pub agent_cmd: String,
