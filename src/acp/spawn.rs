@@ -11,6 +11,7 @@ pub fn spawn_subprocess(cmd: &str, args: &[String], cwd: &Path) -> Result<Child>
     Command::new(cmd)
         .args(args)
         .current_dir(cwd)
+        .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

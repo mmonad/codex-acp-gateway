@@ -18,6 +18,7 @@ use tracing::warn;
 pub struct OutgoingMessageSender {
     tx: mpsc::Sender<String>,
     next_id: Arc<AtomicI64>,
+    message_text: Arc<Mutex<HashMap<String, String>>>,
     pending: Arc<Mutex<HashMap<RequestId, oneshot::Sender<JSONRPCResponse>>>>,
 }
 
@@ -26,6 +27,7 @@ impl OutgoingMessageSender {
         Self {
             tx,
             next_id: Arc::new(AtomicI64::new(1)),
+            message_text: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -56,10 +58,30 @@ impl OutgoingMessageSender {
         method: impl Into<String>,
         params: Option<serde_json::Value>,
     ) -> Result<(), SendError> {
-        let msg = JSONRPCMessage::Notification(JSONRPCNotification {
-            method: method.into(),
-            params,
-        });
+        let method = method.into();
+        let mut params = params;
+        if let Some(value) = params.as_mut() {
+            crate::compatibility::response(&method, value);
+            if method == "item/agentMessage/delta" {
+                if let (Some(id), Some(delta)) = (value["itemId"].as_str(), value["delta"].as_str())
+                {
+                    self.message_text
+                        .lock()
+                        .await
+                        .entry(id.into())
+                        .or_default()
+                        .push_str(delta);
+                }
+            }
+            if method == "item/completed" && value["item"]["type"] == "agentMessage" {
+                if let Some(id) = value["item"]["id"].as_str() {
+                    if let Some(text) = self.message_text.lock().await.remove(id) {
+                        value["item"]["text"] = serde_json::json!(text);
+                    }
+                }
+            }
+        }
+        let msg = JSONRPCMessage::Notification(JSONRPCNotification { method, params });
         self.send_raw(msg).await
     }
 

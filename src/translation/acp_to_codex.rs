@@ -301,35 +301,11 @@ pub fn translate_session_update(
                 diffs: vec![],
             }
         }
-        SessionUpdate::CurrentModeUpdate(update) => TranslationResult {
-            notifications: vec![(
-                "thread/status/changed".to_string(),
-                json!({
-                    "threadId": thread_id,
-                    "mode": update.current_mode_id.0.as_ref(),
-                }),
-            )],
-            diffs: vec![],
-        },
-        SessionUpdate::ConfigOptionUpdate(update) => {
-            let options: Vec<Value> = update
-                .config_options
-                .iter()
-                .map(|opt| {
-                    json!({
-                        "id": opt.id.0.as_ref(),
-                        "name": opt.name,
-                    })
-                })
-                .collect();
+        // Codex has no ACP settings notification. Selection responses update
+        // the cached options; never send malformed thread/status notifications.
+        SessionUpdate::CurrentModeUpdate(_) | SessionUpdate::ConfigOptionUpdate(_) => {
             TranslationResult {
-                notifications: vec![(
-                    "gateway/configOptions/updated".to_string(),
-                    json!({
-                        "threadId": thread_id,
-                        "configOptions": options,
-                    }),
-                )],
+                notifications: vec![],
                 diffs: vec![],
             }
         }
@@ -483,5 +459,16 @@ fn extract_text_from_content(content: &ContentBlock) -> String {
             format!("[resource: {} ({})]", link.name, link.uri)
         }
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod stop_reason_tests {
+    #[test]
+    fn cancelled_prompt_is_interrupted() {
+        let reason = serde_json::to_value(agent_client_protocol::StopReason::Cancelled).unwrap();
+        let (_, params) =
+            super::translate_prompt_response(reason.as_str().unwrap(), "thread", "turn");
+        assert_eq!(params["turn"]["status"], "interrupted");
     }
 }

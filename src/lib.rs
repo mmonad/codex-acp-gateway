@@ -1,8 +1,12 @@
 pub mod acp;
 pub mod acp_proxy;
+pub mod bridge;
+pub mod catalog;
 pub mod command_exec;
+pub mod compatibility;
 pub mod config;
 pub mod error;
+pub mod msp;
 pub mod rollout;
 pub mod sandbox;
 pub mod translation;
@@ -10,7 +14,7 @@ pub mod transport;
 
 use std::rc::Rc;
 
-use agent_client_protocol::{Agent, ClientSideConnection};
+use agent_client_protocol::Agent;
 use anyhow::{Context, Result};
 use codex_app_server_protocol::build_turns_from_rollout_items;
 use codex_app_server_protocol::{JSONRPCMessage, JSONRPCRequest, JSONRPCResponse};
@@ -137,15 +141,25 @@ async fn run_session(
     mut codex_inbound_rx: mpsc::Receiver<TransportEvent>,
     codex_outbound_tx: mpsc::Sender<String>,
 ) -> Result<()> {
+    if config.backend == "router" {
+        return bridge::run(config, cwd, codex_inbound_rx, codex_outbound_tx).await;
+    }
     let outgoing = OutgoingMessageSender::new(codex_outbound_tx);
-
-    let (acp_conn, mut acp_events) = acp::connect(&config.agent_cmd, &config.agent_args, cwd)
-        .await
-        .context("failed to connect to ACP agent")?;
-
+    let mut acp_child = None;
+    let mut muse_host = None;
+    let (agent, mut acp_events): (Rc<dyn Agent>, _) = if config.backend == "muse-msp" {
+        let (agent, host, events) = msp::connect(&config.agent_cmd, cwd).await?;
+        muse_host = Some(host);
+        (Rc::new(agent), events)
+    } else {
+        let (connection, events) = acp::connect(&config.agent_cmd, &config.agent_args, cwd)
+            .await
+            .context("failed to connect to ACP agent")?;
+        acp_child = Some(connection.child);
+        (Rc::new(connection.agent), events)
+    };
     let mut state = GatewayState::new();
     let mut id_map = IdMap::new();
-    let agent = Rc::new(acp_conn.agent);
 
     // Channel for background tasks (e.g. spawn_local prompt) to notify the
     // main loop about lifecycle transitions.
@@ -200,13 +214,19 @@ async fn run_session(
         }
     }
 
+    if let Some((connection, mut host)) = muse_host {
+        connection.close().await;
+        let _ = host.close().await;
+    }
+    drop(acp_child);
+
     Ok(())
 }
 
 /// Handle an incoming JSON-RPC message from the Codex client.
 async fn handle_codex_message(
     message: JSONRPCMessage,
-    agent: &Rc<ClientSideConnection>,
+    agent: &Rc<dyn Agent>,
     outgoing: &OutgoingMessageSender,
     state: &mut GatewayState,
     id_map: &mut IdMap,
@@ -238,7 +258,7 @@ async fn handle_codex_message(
 /// Dispatch a Codex client request to the appropriate handler.
 async fn handle_codex_request(
     req: JSONRPCRequest,
-    agent: &Rc<ClientSideConnection>,
+    agent: &Rc<dyn Agent>,
     outgoing: &OutgoingMessageSender,
     state: &mut GatewayState,
     id_map: &mut IdMap,
@@ -266,6 +286,16 @@ async fn handle_codex_request(
                 internal_tx,
             )
             .await
+        }
+        "thread/settings/update" => {
+            let thread = params["threadId"].as_str().unwrap_or("");
+            if let Some(session) = id_map.lookup_session(thread).cloned() {
+                catalog::update_settings(agent.as_ref(), state, &session, &params).await
+            } else {
+                Err(GatewayError::SessionNotFound {
+                    thread_id: thread.into(),
+                })
+            }
         }
         "turn/interrupt" => handle_turn_interrupt(&params, agent.as_ref(), state, id_map).await,
         "session/setMode" => handle_set_session_mode(&params, agent.as_ref(), state, id_map).await,
@@ -295,13 +325,18 @@ async fn handle_codex_request(
         "thread/rollback" => {
             handle_thread_rollback(&params, agent.as_ref(), state, id_map, cwd).await
         }
-        "model/list" => handle_model_list(state),
+        "model/list" => catalog::list(agent.as_ref(), state, cwd).await,
 
         // Stub handlers — return empty/default responses
-        "config/read" => Ok(json!({ "config": {}, "layers": [] })),
-        "config/value/write" => Ok(json!({ "success": true })),
-        "config/batchWrite" => Ok(json!({ "success": true })),
-        "configRequirements/read" => Ok(json!({ "requirements": {} })),
+        "config/read" => Ok(compatibility::read_config(state)),
+        "config/value/write" => compatibility::write_config(state, &params),
+        "config/batchWrite" => compatibility::write_config(state, &params),
+        "configRequirements/read" => Ok(json!({ "requirements": null })),
+        "plugin/installed" => Ok(json!({"marketplaces": [], "marketplaceLoadErrors": []})),
+        "account/read" => Ok(json!({"account": null, "requiresOpenaiAuth": false})),
+        "account/rateLimits/read" => Ok(json!({"rateLimits": null, "rateLimitsByLimitId": null})),
+        "app/list" => Ok(json!({"data": [], "nextCursor": null})),
+        "collaborationMode/list" => Ok(json!({"data": []})),
         "mcpServerStatus/list" => Ok(json!({ "data": [], "nextCursor": null })),
         "config/mcpServer/reload" => Ok(json!({})),
         "skills/list" => Ok(json!({ "data": [], "nextCursor": null })),
@@ -327,7 +362,8 @@ async fn handle_codex_request(
     ) && result.is_ok();
 
     match result {
-        Ok(value) => {
+        Ok(mut value) => {
+            compatibility::response(&req.method, &mut value);
             // Clone thread info before sending response (which consumes it).
             let thread_obj = if emit_thread_started {
                 value.get("thread").cloned()
@@ -371,16 +407,8 @@ async fn handle_initialize(
     state.agent_capabilities = Some(acp_resp.agent_capabilities.clone());
     state.auth_methods = acp_resp.auth_methods.clone();
 
-    // Auto-authenticate if the agent advertises auth methods.
-    if let Some(first_method) = acp_resp.auth_methods.first() {
-        info!(method_id = %first_method.id.0, "auto-authenticating with agent");
-        let auth_req = agent_client_protocol::AuthenticateRequest::new(first_method.id.clone());
-        agent
-            .authenticate(auth_req)
-            .await
-            .map_err(|e| GatewayError::Acp(format!("authenticate failed: {e:?}")))?;
-    }
-
+    // Existing agent login is authoritative. Advertising auth methods does not mean
+    // login is required; do not unexpectedly launch a new OAuth flow.
     state.initialized = true;
     if let Some(info) = params.get("clientInfo") {
         state.client_name = info.get("name").and_then(|v| v.as_str()).map(String::from);
@@ -400,7 +428,7 @@ async fn handle_initialize(
         .unwrap_or("unknown");
 
     Ok(json!({
-        "userAgent": format!("codex-acp-gateway/0.1.0 (acp-agent/{agent_version})"),
+        "userAgent": format!("codex-acp-gateway {} (ACP agent {agent_version}; Codex protocol 0.167.1)", env!("CARGO_PKG_VERSION")),
         "protocolVersion": protocol_version,
         "capabilities": {
             "experimental": {},
@@ -420,6 +448,13 @@ async fn handle_thread_start(
         return Err(GatewayError::NotInitialized);
     }
 
+    let requested_cwd = params
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let cwd = requested_cwd.as_path();
+
     let thread_id = id_map::new_thread_id();
     state.set_lifecycle(thread_id.clone(), SessionLifecycle::Creating);
 
@@ -431,6 +466,7 @@ async fn handle_thread_start(
 
     let session_id = acp_resp.session_id.to_string();
     id_map.create_thread_session_mapping(thread_id.clone(), session_id.clone());
+    catalog::save_session(state, &thread_id, &session_id)?;
     state.set_lifecycle(
         thread_id.clone(),
         SessionLifecycle::Idle {
@@ -438,6 +474,12 @@ async fn handle_thread_start(
         },
     );
 
+    if let Some(options) = acp_resp.config_options {
+        state.session_config.insert(session_id.clone(), options);
+    }
+    if let Some(modes) = acp_resp.modes {
+        state.session_modes.insert(session_id.clone(), modes);
+    }
     // Store model state from the agent if available.
     if let Some(models) = acp_resp.models {
         state.model_state = Some(models);
@@ -445,19 +487,7 @@ async fn handle_thread_start(
 
     info!(%thread_id, %session_id, "thread/session created");
 
-    // If the client requested a specific model and the agent supports model
-    // selection, attempt to set it. This is best-effort — failure doesn't
-    // block thread creation.
-    if let Some(model) = params.get("model").and_then(|v| v.as_str()) {
-        let has_models = state.model_state.is_some();
-        if has_models {
-            let model_req = codex_to_acp::translate_set_session_model(&session_id, model);
-            match agent.set_session_model(model_req).await {
-                Ok(_) => info!(%thread_id, %model, "session model set"),
-                Err(e) => debug!(%thread_id, %model, "set_session_model failed (non-fatal): {e:?}"),
-            }
-        }
-    }
+    catalog::select(agent, state, &session_id, params).await?;
 
     // Build SessionMetaLine for the rollout recorder.
     let now_str = OffsetDateTime::now_utc()
@@ -497,7 +527,8 @@ async fn handle_thread_start(
             "status": { "type": "idle" },
             "turns": [],
         },
-        "model": "acp-agent",
+        "model": catalog::current(state, &session_id).0,
+        "reasoningEffort": catalog::current(state, &session_id).1,
         "modelProvider": "acp",
         "cwd": cwd.to_string_lossy(),
         "approvalPolicy": "on-request",
@@ -507,11 +538,11 @@ async fn handle_thread_start(
 
 /// Handle `turn/start` - send a prompt to the ACP session.
 ///
-/// Takes an `Rc<ClientSideConnection>` (not a reference) so we can move a clone
+/// Takes an `Rc<dyn Agent>` (not a reference) so we can move a clone
 /// into the `spawn_local` task that drives the prompt to completion.
 async fn handle_turn_start(
     params: &Value,
-    agent: Rc<ClientSideConnection>,
+    agent: Rc<dyn Agent>,
     outgoing: &OutgoingMessageSender,
     state: &mut GatewayState,
     id_map: &mut IdMap,
@@ -528,6 +559,8 @@ async fn handle_turn_start(
             thread_id: thread_id.into(),
         })?
         .clone();
+
+    catalog::select(agent.as_ref(), state, &session_id, params).await?;
 
     let turn_id = id_map::new_turn_id();
 
@@ -615,9 +648,10 @@ async fn handle_turn_start(
                     let _ = outgoing_clone.send_notification(method, Some(params)).await;
                 }
 
-                let stop_reason = format!("{:?}", resp.stop_reason);
+                let stop_reason =
+                    serde_json::to_value(resp.stop_reason).unwrap_or(json!("end_turn"));
                 let (method, params) = acp_to_codex::translate_prompt_response(
-                    &stop_reason,
+                    stop_reason.as_str().unwrap_or("end_turn"),
                     &thread_id_owned,
                     &turn_id_clone,
                 );
@@ -704,6 +738,18 @@ async fn handle_turn_interrupt(
         })?
         .clone();
 
+    if let SessionLifecycle::InTurn { turn_id, .. } = state.lifecycle(thread_id) {
+        if params["turnId"]
+            .as_str()
+            .is_some_and(|requested| requested != turn_id)
+        {
+            return Err(GatewayError::Translation(
+                "Cannot interrupt a different turn".into(),
+            ));
+        }
+    } else {
+        return Ok(json!({}));
+    }
     agent
         .cancel(agent_client_protocol::CancelNotification::new(
             session_id.clone(),
@@ -711,7 +757,7 @@ async fn handle_turn_interrupt(
         .await
         .map_err(|e| GatewayError::Acp(format!("{e:?}")))?;
 
-    state.set_lifecycle(thread_id.to_string(), SessionLifecycle::Idle { session_id });
+    // Keep routing final notifications until the prompt acknowledges cancellation.
 
     Ok(json!({}))
 }
@@ -739,6 +785,7 @@ async fn handle_thread_resume(
     let session_id = id_map
         .lookup_session(thread_id)
         .cloned()
+        .or_else(|| catalog::load_session(state, thread_id))
         .unwrap_or_else(|| thread_id.to_string());
 
     state.set_lifecycle(thread_id.to_string(), SessionLifecycle::Loading);
@@ -788,16 +835,7 @@ async fn handle_thread_resume(
         },
     );
 
-    // If the client requested a specific model, attempt to set it.
-    if let Some(model) = params.get("model").and_then(|v| v.as_str()) {
-        let model_req = codex_to_acp::translate_set_session_model(&session_id, model);
-        match agent.set_session_model(model_req).await {
-            Ok(_) => info!(%thread_id, %model, "session model set on resume"),
-            Err(e) => {
-                debug!(%thread_id, %model, "set_session_model on resume failed (non-fatal): {e:?}")
-            }
-        }
-    }
+    catalog::select(agent, state, &session_id, params).await?;
 
     info!(%thread_id, %session_id, "thread/session resumed");
 
@@ -830,7 +868,8 @@ async fn handle_thread_resume(
             "status": { "type": "idle" },
             "turns": [],
         },
-        "model": "acp-agent",
+        "model": catalog::current(state, &session_id).0,
+        "reasoningEffort": catalog::current(state, &session_id).1,
         "modelProvider": meta_provider,
         "cwd": cwd.to_string_lossy(),
         "approvalPolicy": "on-request",
@@ -1979,33 +2018,6 @@ async fn handle_thread_unarchive(
             "turns": [],
         },
     }))
-}
-
-/// Handle `model/list` — return available models from the agent if known.
-///
-/// Uses the agent's `SessionModelState` from the last session creation/load
-/// response. Falls back to a generic "acp-agent" entry if the agent doesn't
-/// advertise model selection.
-fn handle_model_list(state: &GatewayState) -> Result<Value, GatewayError> {
-    // Check if we have model state from the agent's last session response.
-    // The model state is stored when `NewSessionResponse.models` or
-    // `LoadSessionResponse.models` is `Some`.
-    if let Some(ref model_state) = state.model_state {
-        let data: Vec<Value> = model_state
-            .available_models
-            .iter()
-            .map(|m| {
-                json!({
-                    "id": m.model_id.0.as_ref(),
-                    "name": m.name,
-                    "description": m.description,
-                })
-            })
-            .collect();
-        return Ok(json!({ "data": data, "nextCursor": null }));
-    }
-
-    Ok(json!({ "data": [{ "id": "acp-agent", "name": "ACP Agent" }], "nextCursor": null }))
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────
